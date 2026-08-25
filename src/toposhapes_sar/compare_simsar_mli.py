@@ -71,7 +71,7 @@ def make_intensity_histogram(
     simsar,
     output_png,
     *,
-    median_size=9,
+    median_size=15,
     bins=150,
     title=None,
 ):
@@ -355,7 +355,7 @@ def compare_simsar_mli(
         mli=mli,
         simsar=simsar,
         output_png=histogram_png,
-        median_size=9,
+        median_size=15,
         bins=150,
         title="MLI vs simulated SAR intensity distributions",
     )
