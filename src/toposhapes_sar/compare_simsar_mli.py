@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-
+from scipy.ndimage import median_filter
 import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
@@ -66,7 +66,271 @@ def robust_standardize(data):
     result[valid] = (data[valid] - median) / scale
 
     return result
+def make_intensity_histogram(
+    mli,
+    simsar,
+    output_png,
+    *,
+    median_size=9,
+    bins=150,
+    title=None,
+):
+    """
+    Compare observed and simulated SAR intensity distributions.
 
+    Processing
+    ----------
+    1. Remove invalid / non-positive pixels.
+    2. Median-filter the observed MLI in linear intensity space.
+    3. Convert all data to dB using 10*log10(intensity).
+    4. Shift sim_sar in dB so its median matches the median-filtered MLI.
+    5. Plot normalized histograms.
+    """
+
+    output_png = Path(output_png)
+
+    # ------------------------------------------------------------
+    # Valid data
+    # ------------------------------------------------------------
+
+    mli_linear = np.asarray(mli, dtype=np.float32)
+    sim_linear = np.asarray(simsar, dtype=np.float32)
+
+    mli_valid = (
+        np.isfinite(mli_linear)
+        & (mli_linear > 0)
+    )
+
+    sim_valid = (
+        np.isfinite(sim_linear)
+        & (sim_linear > 0)
+    )
+
+    # ------------------------------------------------------------
+    # Median-filter MLI
+    #
+    # Fill invalid pixels with the global median temporarily so
+    # extreme nodata values do not enter the filter.
+    # ------------------------------------------------------------
+
+    mli_work = mli_linear.copy()
+
+    global_median = np.median(
+        mli_work[mli_valid]
+    )
+
+    mli_work[~mli_valid] = global_median
+
+    mli_filtered = median_filter(
+        mli_work,
+        size=median_size,
+        mode="nearest",
+    )
+
+    # Restore invalid source pixels to NaN
+    mli_filtered[~mli_valid] = np.nan
+
+    # ------------------------------------------------------------
+    # Log intensity
+    # ------------------------------------------------------------
+
+    mli_db = log_intensity(mli_linear)
+    mli_filtered_db = log_intensity(mli_filtered)
+    sim_db = log_intensity(sim_linear)
+
+    # ------------------------------------------------------------
+    # Use pixels valid in all relevant datasets
+    # ------------------------------------------------------------
+
+    common_valid = (
+        np.isfinite(mli_db)
+        & np.isfinite(mli_filtered_db)
+        & np.isfinite(sim_db)
+    )
+
+    if not np.any(common_valid):
+        raise ValueError(
+            "No common valid pixels for histogram comparison."
+        )
+
+    mli_values = mli_db[common_valid]
+    filtered_values = mli_filtered_db[common_valid]
+    sim_values = sim_db[common_valid]
+
+    # ------------------------------------------------------------
+    # Median alignment
+    # ------------------------------------------------------------
+
+    filtered_median = float(
+        np.median(filtered_values)
+    )
+
+    sim_median = float(
+        np.median(sim_values)
+    )
+
+    median_shift_db = (
+        filtered_median - sim_median
+    )
+
+    sim_scaled_values = (
+        sim_values + median_shift_db
+    )
+
+    print("\n[CHECK] MLI median filtering")
+    print(
+        f"        Median filter: {median_size} x {median_size} pixels"
+    )
+    print(
+        "        Purpose: suppress small-scale SAR speckle/outliers "
+        "at approximately DEM-scale resolution."
+    )
+
+    print("\n[CHECK] Median intensity alignment")
+    print(
+        "        Median filtered MLI:",
+        filtered_median,
+        "dB",
+    )
+    print(
+        "        Median original sim_sar:",
+        sim_median,
+        "dB",
+    )
+    print(
+        "        sim_sar shift:",
+        median_shift_db,
+        "dB",
+    )
+    print(
+        "        Median scaled sim_sar:",
+        float(np.median(sim_scaled_values)),
+        "dB",
+    )
+
+    # ------------------------------------------------------------
+    # Common histogram limits
+    #
+    # Use robust percentiles so isolated extreme values do not
+    # determine the plot extent.
+    # ------------------------------------------------------------
+
+    all_values = np.concatenate([
+        mli_values,
+        filtered_values,
+        sim_values,
+        sim_scaled_values,
+    ])
+
+    hist_min = float(
+        np.nanpercentile(all_values, 0.5)
+    )
+
+    hist_max = float(
+        np.nanpercentile(all_values, 99.5)
+    )
+
+    bin_edges = np.linspace(
+        hist_min,
+        hist_max,
+        bins + 1,
+    )
+
+    # ------------------------------------------------------------
+    # Plot
+    # ------------------------------------------------------------
+
+    fig, ax = plt.subplots(
+        figsize=(9, 6)
+    )
+
+    ax.hist(
+        mli_values,
+        bins=bin_edges,
+        density=True,
+        histtype="step",
+        linewidth=1.2,
+        label="Original MLI",
+    )
+
+    ax.hist(
+        filtered_values,
+        bins=bin_edges,
+        density=True,
+        histtype="step",
+        linewidth=2.0,
+        label=f"MLI median filtered ({median_size}×{median_size})",
+    )
+
+    ax.hist(
+        sim_values,
+        bins=bin_edges,
+        density=True,
+        histtype="step",
+        linewidth=1.2,
+        label="Original sim_sar",
+    )
+
+    ax.hist(
+        sim_scaled_values,
+        bins=bin_edges,
+        density=True,
+        histtype="step",
+        linewidth=2.0,
+        label="Median-aligned sim_sar",
+    )
+
+    # Median markers
+    ax.axvline(
+        filtered_median,
+        linestyle="--",
+        linewidth=1,
+        label="Filtered MLI / scaled sim_sar median",
+    )
+
+    ax.axvline(
+        sim_median,
+        linestyle=":",
+        linewidth=1,
+        label="Original sim_sar median",
+    )
+
+    ax.set_xlabel("Log intensity (dB)")
+    ax.set_ylabel("Probability density")
+
+    if title is None:
+        title = "Observed and simulated SAR intensity distributions"
+
+    ax.set_title(title)
+    ax.legend()
+
+    ax.grid(alpha=0.2)
+
+    output_png.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    fig.savefig(
+        output_png,
+        dpi=200,
+        bbox_inches="tight",
+    )
+
+    plt.close(fig)
+
+    print("\n[PASS] Intensity histogram written:")
+    print("      ", output_png)
+
+    return {
+        "median_filter_size": median_size,
+        "mli_filtered_median_db": filtered_median,
+        "simsar_original_median_db": sim_median,
+        "simsar_shift_db": median_shift_db,
+        "simsar_scaled_median_db": float(
+            np.median(sim_scaled_values)
+        ),
+    }
 
 def compare_simsar_mli(
     simsar_tif,
@@ -82,6 +346,19 @@ def compare_simsar_mli(
     simsar, sim_meta = read_single_band_tif(simsar_tif)
     mli, mli_meta = read_single_band_tif(mli_tif)
 
+
+    histogram_png = output_png.with_name(
+        output_png.stem + "_histogram.png"
+    )
+
+    hist_stats = make_intensity_histogram(
+        mli=mli,
+        simsar=simsar,
+        output_png=histogram_png,
+        median_size=9,
+        bins=150,
+        title="MLI vs simulated SAR intensity distributions",
+    )
     print("\n[CHECK] Input raster geometry")
     print("        sim_sar shape:", simsar.shape)
     print("        MLI shape:    ", mli.shape)
