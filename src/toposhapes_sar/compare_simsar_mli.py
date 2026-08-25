@@ -576,6 +576,7 @@ def plot_spatial_comparison(
         vmin=-diff_limit,
         vmax=diff_limit,
         cmap="RdBu_r",
+        origin="lower",
     )
 
     axes[2].set_title(
@@ -599,7 +600,9 @@ def plot_spatial_comparison(
     # GAMMA radar rasters normally have azimuth line 0 at top
     for ax in axes:
         ax.invert_yaxis()
-
+        ax.set_aspect("equal")
+        ax.set_xlim([750,1150])
+        ax.set_ylim([1950,2100])
     if title is None:
         title = (
             "Filtered observed MLI vs "
