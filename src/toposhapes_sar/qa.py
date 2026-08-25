@@ -88,7 +88,7 @@ def save_modified_dem_plot(
         x="x",
         y="y",
         levels=[0.5],
-        colors="red",
+        colors=["red"],
         linewidths=1.5,
         add_colorbar=False,
     )
