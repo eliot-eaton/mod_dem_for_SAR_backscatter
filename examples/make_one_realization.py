@@ -74,8 +74,8 @@ shape_z = surface - 10.0
 
 shape = RotatedEllipsoid(
     center=(shape_x, shape_y, shape_z),
-    semi_axes=(50.0, 50.0, 50.0),
-    rotation_deg=(30.0, 0.0, 0.0),
+    semi_axes=(100.0, 100.0, 50.0),
+    rotation_deg=(0.0, 0.0, 0.0),
 )
 interaction = "fill_to_upper"
 
