@@ -57,8 +57,8 @@ def run_gc_map2_test(
         str(map_dem_par),
         str(map_dem),
         str(lookup),
-        5,
-        5,
+        1,
+        1,
         str(ls_map),
         str(ls_map_rdc),
         str(inc),
@@ -112,9 +112,9 @@ def run_gc_map2_test(
 
 
 outputs = run_gc_map2_test(
-    dem_path="/path/to/P.test.dem",
-    dem_par_path="/path/to/P.dem_par",
-    mli_par_path="/path/to/20210208.mli.par",
-    output_dir="/path/to/gamma_test",
-    run_id="test",
+    dem_path="./mod_dem/P.001.dem",
+    dem_par_path="./mod_dem/P.dem_par",
+    mli_par_path="./slcs/20210208M/20210208.mli.par",
+    output_dir="./sim_sar",
+    run_id="001",
 )    
