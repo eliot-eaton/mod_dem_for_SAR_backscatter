@@ -65,3 +65,23 @@ All `gc_map2` map DEM / lookup / geometry products are temporary unless `keep_wo
 ## Reference notebook
 
 The supplied notebook is preserved at `docs/modify_P_dem_reference.ipynb` for traceability.
+
+## Visual QA plots for every realization
+
+`examples/make_one_realization.py` now writes two cropped PNGs automatically from the projected metre-grid DEM:
+
+- `{ID}.dem_check.png` — modified DEM shown as colour plus elevation contours; a red outline marks the intentionally changed footprint.
+- `{ID}.difference_check.png` — the authoritative projected displacement `dz = modified - original`, so positive additions and negative excavations are immediately visible.
+
+By default the crop contains every changed pixel plus **500 m of context on each side**. Change `QA_PADDING_M` in the example workflow if a tighter or wider view is useful. Cropping is visualization-only; the DEM itself always remains full size.
+
+For a run with `RUN_ID = "001"`, the persistent realization outputs are therefore:
+
+```text
+P.001.dem
+001.json
+001.dem_check.png
+001.difference_check.png
+```
+
+The JSON also records the QA filenames.
