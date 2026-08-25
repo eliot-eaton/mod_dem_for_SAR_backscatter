@@ -6,7 +6,6 @@ import re
 
 import numpy as np
 import xarray as xr
-import rioxarray  # noqa: F401
 from rasterio.transform import from_origin
 
 
@@ -76,6 +75,7 @@ def read_gamma_dem(
     byte_order: str = "big",
 ) -> tuple[xr.DataArray, GammaDEMMetadata]:
     """Read an original GAMMA EQA REAL*4 DEM as the authoritative geographic grid."""
+    import rioxarray  # noqa: F401
     dem_path = Path(dem_path)
     meta = parse_gamma_dem_par(par_path)
     dtype = {"big": ">f4", "little": "<f4"}.get(byte_order)
