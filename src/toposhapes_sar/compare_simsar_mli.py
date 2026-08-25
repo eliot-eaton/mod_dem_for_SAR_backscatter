@@ -575,8 +575,7 @@ def plot_spatial_comparison(
         shading="auto",
         vmin=-diff_limit,
         vmax=diff_limit,
-        cmap="RdBu_r",
-        origin="lower",
+        cmap="RdBu_r"
     )
 
     axes[2].set_title(
