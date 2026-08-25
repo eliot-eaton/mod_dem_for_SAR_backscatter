@@ -600,7 +600,7 @@ def plot_spatial_comparison(
     for ax in axes:
         ax.invert_yaxis()
         ax.set_aspect("equal")
-        ax.set_xlim([750,1150])
+        ax.set_xlim([750,1000])
         ax.set_ylim([1950,2100])
     if title is None:
         title = (
