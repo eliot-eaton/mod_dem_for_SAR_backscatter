@@ -330,14 +330,28 @@ for i, (
     # QA plots
     # -------------------------------------------------------------------------
 
-    qa_outputs = save_qa_plots(
-        dem_m_modified,
-        dz_m,
-        OUT,
-        run_id,
-        padding_m=QA_PADDING_M,
-    )
+ # -------------------------------------------------------------------------
+# QA plots
+# -------------------------------------------------------------------------
 
+    if changed_m > 0:
+        qa_outputs = save_qa_plots(
+            dem_m_modified,
+            dz_m,
+            OUT,
+            run_id,
+            padding_m=QA_PADDING_M,
+        )
+    else:
+        qa_outputs = {
+            "modified_dem_plot": None,
+            "difference_plot": None,
+        }
+
+        print(
+            "        [CHECK] No QA plots created because "
+            "this realization does not modify the DEM."
+        )
     # -------------------------------------------------------------------------
     # Transfer ONLY dz to original geographic grid
     # -------------------------------------------------------------------------
@@ -429,7 +443,11 @@ for i, (
             DEPTH_BELOW_REFERENCE_SURFACE_M
         ),
     }
-    
+    record["surface_intersection"] = {
+        "changed_pixels_projected": int(changed_m),
+        "modifies_surface": bool(changed_m > 0),
+    }
+        
 
     write_run_json(
         json_out,
