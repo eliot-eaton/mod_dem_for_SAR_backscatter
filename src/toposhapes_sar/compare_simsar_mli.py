@@ -480,19 +480,9 @@ def plot_spatial_comparison(
         ],
     ])
 
-    vmin = float(
-        np.nanpercentile(
-            combined,
-            2,
-        )
-    )
+    vmin = -30
 
-    vmax = float(
-        np.nanpercentile(
-            combined,
-            98,
-        )
-    )
+    vmax = 5
 
     # ------------------------------------------------------------
     # Symmetric difference scale
@@ -528,6 +518,7 @@ def plot_spatial_comparison(
     im0 = axes[0].pcolormesh(
         mli_filtered_db,
         shading="auto",
+        cmap="gray",
         vmin=vmin,
         vmax=vmax,
     )
@@ -556,6 +547,7 @@ def plot_spatial_comparison(
         shading="auto",
         vmin=vmin,
         vmax=vmax,
+        cmap="gray",
     )
 
     axes[1].set_title(
