@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from scipy.ndimage import median_filter
+
 import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
+from scipy.ndimage import median_filter
 
 
 def read_single_band_tif(path):
+    """
+    Read band 1 from a GeoTIFF.
+    """
     path = Path(path)
 
     with rasterio.open(path) as src:
@@ -29,97 +33,117 @@ def read_single_band_tif(path):
 
 def log_intensity(data):
     """
-    Convert positive intensity values to log10 space.
+    Convert positive linear intensity to dB using:
 
-    Non-positive and non-finite values become NaN.
+        10 * log10(intensity)
+
+    Non-positive or non-finite values become NaN.
     """
-    out = np.full(data.shape, np.nan, dtype=np.float32)
+    data = np.asarray(data)
 
-    valid = np.isfinite(data) & (data > 0)
+    out = np.full(
+        data.shape,
+        np.nan,
+        dtype=np.float32,
+    )
 
-    out[valid] = 10.0 * np.log10(data[valid])
+    valid = (
+        np.isfinite(data)
+        & (data > 0)
+    )
+
+    out[valid] = (
+        10.0 * np.log10(data[valid])
+    )
 
     return out
 
 
-def robust_standardize(data):
-    """
-    Robust normalization for visual comparison.
-
-    Uses median and MAD so the comparison is less sensitive
-    to very bright SAR pixels.
-    """
-    valid = np.isfinite(data)
-
-    values = data[valid]
-
-    median = np.median(values)
-    mad = np.median(np.abs(values - median))
-
-    if mad == 0:
-        raise ValueError("MAD is zero; cannot standardize raster.")
-
-    scale = 1.4826 * mad
-
-    result = np.full(data.shape, np.nan, dtype=np.float32)
-
-    result[valid] = (data[valid] - median) / scale
-
-    return result
-def make_intensity_histogram(
+def prepare_filtered_mli_and_scaled_simsar(
     mli,
     simsar,
-    output_png,
     *,
-    median_size=15,
-    bins=150,
-    title=None,
+    median_size=9,
 ):
     """
-    Compare observed and simulated SAR intensity distributions.
+    Prepare MLI and simulated SAR for comparison.
 
-    Processing
-    ----------
-    1. Remove invalid / non-positive pixels.
-    2. Median-filter the observed MLI in linear intensity space.
-    3. Convert all data to dB using 10*log10(intensity).
-    4. Shift sim_sar in dB so its median matches the median-filtered MLI.
-    5. Plot normalized histograms.
+    Steps
+    -----
+    1. Median-filter MLI in linear intensity space.
+    2. Convert filtered MLI to dB.
+    3. Convert sim_sar to dB.
+    4. Shift sim_sar in dB so its median matches the filtered MLI.
+
+    Returns
+    -------
+    mli_filtered : ndarray
+        Median-filtered MLI in linear intensity.
+
+    mli_db : ndarray
+        Original MLI in dB.
+
+    mli_filtered_db : ndarray
+        Median-filtered MLI in dB.
+
+    sim_db : ndarray
+        Original sim_sar in dB.
+
+    sim_scaled_db : ndarray
+        sim_sar shifted in dB so its median matches filtered MLI.
+
+    median_shift_db : float
+        Additive dB shift applied to sim_sar.
     """
 
-    output_png = Path(output_png)
+    mli = np.asarray(
+        mli,
+        dtype=np.float32,
+    )
+
+    simsar = np.asarray(
+        simsar,
+        dtype=np.float32,
+    )
 
     # ------------------------------------------------------------
-    # Valid data
+    # Identify valid pixels
     # ------------------------------------------------------------
-
-    mli_linear = np.asarray(mli, dtype=np.float32)
-    sim_linear = np.asarray(simsar, dtype=np.float32)
 
     mli_valid = (
-        np.isfinite(mli_linear)
-        & (mli_linear > 0)
+        np.isfinite(mli)
+        & (mli > 0)
     )
 
     sim_valid = (
-        np.isfinite(sim_linear)
-        & (sim_linear > 0)
+        np.isfinite(simsar)
+        & (simsar > 0)
     )
 
+    if not np.any(mli_valid):
+        raise ValueError(
+            "MLI contains no finite positive pixels."
+        )
+
+    if not np.any(sim_valid):
+        raise ValueError(
+            "sim_sar contains no finite positive pixels."
+        )
+
     # ------------------------------------------------------------
-    # Median-filter MLI
+    # Median-filter MLI in linear intensity space
     #
-    # Fill invalid pixels with the global median temporarily so
-    # extreme nodata values do not enter the filter.
+    # Invalid pixels are temporarily filled with the global valid
+    # median so they do not inject extreme values into the filter.
     # ------------------------------------------------------------
 
-    mli_work = mli_linear.copy()
+    mli_work = mli.copy()
 
-    global_median = np.median(
-        mli_work[mli_valid]
+    mli_fill_value = float(
+        np.median(mli[mli_valid])
     )
 
-    mli_work[~mli_valid] = global_median
+    mli_work[~mli_valid] = mli_fill_value
 
     mli_filtered = median_filter(
         mli_work,
@@ -127,107 +151,162 @@ def make_intensity_histogram(
         mode="nearest",
     )
 
-    # Restore invalid source pixels to NaN
+    # Restore invalid original pixels
     mli_filtered[~mli_valid] = np.nan
 
     # ------------------------------------------------------------
-    # Log intensity
+    # Convert to dB
     # ------------------------------------------------------------
 
-    mli_db = log_intensity(mli_linear)
-    mli_filtered_db = log_intensity(mli_filtered)
-    sim_db = log_intensity(sim_linear)
+    mli_db = log_intensity(mli)
+
+    mli_filtered_db = log_intensity(
+        mli_filtered
+    )
+
+    sim_db = log_intensity(simsar)
 
     # ------------------------------------------------------------
-    # Use pixels valid in all relevant datasets
+    # Compare medians only where both filtered MLI and sim_sar
+    # contain valid values.
     # ------------------------------------------------------------
 
     common_valid = (
-        np.isfinite(mli_db)
-        & np.isfinite(mli_filtered_db)
+        np.isfinite(mli_filtered_db)
         & np.isfinite(sim_db)
     )
 
     if not np.any(common_valid):
         raise ValueError(
-            "No common valid pixels for histogram comparison."
+            "No common valid pixels between "
+            "filtered MLI and sim_sar."
         )
 
-    mli_values = mli_db[common_valid]
-    filtered_values = mli_filtered_db[common_valid]
-    sim_values = sim_db[common_valid]
-
-    # ------------------------------------------------------------
-    # Median alignment
-    # ------------------------------------------------------------
-
-    filtered_median = float(
-        np.median(filtered_values)
+    mli_filtered_median_db = float(
+        np.median(
+            mli_filtered_db[common_valid]
+        )
     )
 
-    sim_median = float(
-        np.median(sim_values)
+    sim_median_db = float(
+        np.median(
+            sim_db[common_valid]
+        )
     )
 
     median_shift_db = (
-        filtered_median - sim_median
+        mli_filtered_median_db
+        - sim_median_db
     )
 
-    sim_scaled_values = (
-        sim_values + median_shift_db
+    sim_scaled_db = (
+        sim_db + median_shift_db
     )
 
-    print("\n[CHECK] MLI median filtering")
+    print("\n[CHECK] MLI filtering and sim_sar scaling")
+
     print(
-        f"        Median filter: {median_size} x {median_size} pixels"
-    )
-    print(
-        "        Purpose: suppress small-scale SAR speckle/outliers "
-        "at approximately DEM-scale resolution."
+        f"        Median filter: "
+        f"{median_size} x {median_size} pixels"
     )
 
-    print("\n[CHECK] Median intensity alignment")
     print(
-        "        Median filtered MLI:",
-        filtered_median,
-        "dB",
+        "        Filtered MLI median:",
+        f"{mli_filtered_median_db:.3f} dB",
     )
+
     print(
-        "        Median original sim_sar:",
-        sim_median,
-        "dB",
+        "        Original sim_sar median:",
+        f"{sim_median_db:.3f} dB",
     )
+
     print(
         "        sim_sar shift:",
-        median_shift_db,
-        "dB",
+        f"{median_shift_db:+.3f} dB",
     )
+
     print(
-        "        Median scaled sim_sar:",
-        float(np.median(sim_scaled_values)),
-        "dB",
+        "        Scaled sim_sar median:",
+        f"{np.median(sim_scaled_db[common_valid]):.3f} dB",
+    )
+
+    return {
+        "mli_filtered": mli_filtered,
+        "mli_db": mli_db,
+        "mli_filtered_db": mli_filtered_db,
+        "sim_db": sim_db,
+        "sim_scaled_db": sim_scaled_db,
+        "median_shift_db": median_shift_db,
+        "common_valid": common_valid,
+    }
+
+
+def plot_histogram_comparison(
+    prepared,
+    output_png,
+    *,
+    bins=150,
+    title=None,
+):
+    """
+    Plot log-intensity histograms of:
+
+    - original MLI
+    - median-filtered MLI
+    - original sim_sar
+    - median-aligned sim_sar
+    """
+
+    output_png = Path(output_png)
+
+    mli_db = prepared["mli_db"]
+    mli_filtered_db = prepared[
+        "mli_filtered_db"
+    ]
+    sim_db = prepared["sim_db"]
+    sim_scaled_db = prepared[
+        "sim_scaled_db"
+    ]
+
+    common_valid = prepared[
+        "common_valid"
+    ]
+
+    mli_values = mli_db[common_valid]
+
+    filtered_values = (
+        mli_filtered_db[common_valid]
+    )
+
+    sim_values = sim_db[common_valid]
+
+    scaled_values = (
+        sim_scaled_db[common_valid]
     )
 
     # ------------------------------------------------------------
-    # Common histogram limits
-    #
-    # Use robust percentiles so isolated extreme values do not
-    # determine the plot extent.
+    # Robust histogram range
     # ------------------------------------------------------------
 
     all_values = np.concatenate([
         mli_values,
         filtered_values,
         sim_values,
-        sim_scaled_values,
+        scaled_values,
     ])
 
     hist_min = float(
-        np.nanpercentile(all_values, 0.5)
+        np.nanpercentile(
+            all_values,
+            0.5,
+        )
     )
 
     hist_max = float(
-        np.nanpercentile(all_values, 99.5)
+        np.nanpercentile(
+            all_values,
+            99.5,
+        )
     )
 
     bin_edges = np.linspace(
@@ -259,7 +338,7 @@ def make_intensity_histogram(
         density=True,
         histtype="step",
         linewidth=2.0,
-        label=f"MLI median filtered ({median_size}×{median_size})",
+        label="MLI median filtered",
     )
 
     ax.hist(
@@ -272,7 +351,7 @@ def make_intensity_histogram(
     )
 
     ax.hist(
-        sim_scaled_values,
+        scaled_values,
         bins=bin_edges,
         density=True,
         histtype="step",
@@ -280,7 +359,14 @@ def make_intensity_histogram(
         label="Median-aligned sim_sar",
     )
 
-    # Median markers
+    filtered_median = float(
+        np.median(filtered_values)
+    )
+
+    original_sim_median = float(
+        np.median(sim_values)
+    )
+
     ax.axvline(
         filtered_median,
         linestyle="--",
@@ -289,19 +375,28 @@ def make_intensity_histogram(
     )
 
     ax.axvline(
-        sim_median,
+        original_sim_median,
         linestyle=":",
         linewidth=1,
         label="Original sim_sar median",
     )
 
-    ax.set_xlabel("Log intensity (dB)")
-    ax.set_ylabel("Probability density")
+    ax.set_xlabel(
+        "Log intensity (dB)"
+    )
+
+    ax.set_ylabel(
+        "Probability density"
+    )
 
     if title is None:
-        title = "Observed and simulated SAR intensity distributions"
+        title = (
+            "Observed and simulated SAR "
+            "intensity distributions"
+        )
 
     ax.set_title(title)
+
     ax.legend()
 
     ax.grid(alpha=0.2)
@@ -319,142 +414,103 @@ def make_intensity_histogram(
 
     plt.close(fig)
 
-    print("\n[PASS] Intensity histogram written:")
-    print("      ", output_png)
+    print(
+        "\n[PASS] Histogram comparison written:"
+    )
 
-    return {
-        "median_filter_size": median_size,
-        "mli_filtered_median_db": filtered_median,
-        "simsar_original_median_db": sim_median,
-        "simsar_shift_db": median_shift_db,
-        "simsar_scaled_median_db": float(
-            np.median(sim_scaled_values)
-        ),
-    }
+    print(
+        "      ",
+        output_png,
+    )
 
-def compare_simsar_mli(
-    simsar_tif,
-    mli_tif,
+
+def plot_spatial_comparison(
+    prepared,
     output_png,
     *,
     title=None,
 ):
-    simsar_tif = Path(simsar_tif)
-    mli_tif = Path(mli_tif)
+    """
+    Spatial comparison using:
+
+    - 9x9 median-filtered observed MLI
+    - median-aligned simulated SAR
+    - scaled sim_sar - filtered MLI
+    """
+
     output_png = Path(output_png)
 
-    simsar, sim_meta = read_single_band_tif(simsar_tif)
-    mli, mli_meta = read_single_band_tif(mli_tif)
+    mli_filtered_db = prepared[
+        "mli_filtered_db"
+    ]
 
+    sim_scaled_db = prepared[
+        "sim_scaled_db"
+    ]
 
-    histogram_png = output_png.with_name(
-        output_png.stem + "_histogram.png"
+    median_shift_db = prepared[
+        "median_shift_db"
+    ]
+
+    common_valid = prepared[
+        "common_valid"
+    ]
+
+    difference_db = (
+        sim_scaled_db
+        - mli_filtered_db
     )
 
-    hist_stats = make_intensity_histogram(
-        mli=mli,
-        simsar=simsar,
-        output_png=histogram_png,
-        median_size=15,
-        bins=150,
-        title="MLI vs simulated SAR intensity distributions",
-    )
-    print("\n[CHECK] Input raster geometry")
-    print("        sim_sar shape:", simsar.shape)
-    print("        MLI shape:    ", mli.shape)
+    difference_db = difference_db.copy()
 
-    if simsar.shape != mli.shape:
-        raise ValueError(
-            "sim_sar and MLI shapes differ. "
-            "No resampling has been performed because radar geometry "
-            "should already match."
-        )
-
-    print("\n[CHECK] Pixel dimensions agree.")
-    print(
-        "        We deliberately do not resample either image before "
-        "comparison."
-    )
+    difference_db[
+        ~common_valid
+    ] = np.nan
 
     # ------------------------------------------------------------
-    # Convert both to log intensity
-    # ------------------------------------------------------------
-
-    sim_log = log_intensity(simsar)
-    mli_log = log_intensity(mli)
-
-    common_valid = (
-        np.isfinite(sim_log)
-        & np.isfinite(mli_log)
-    )
-
-    n_common = int(np.count_nonzero(common_valid))
-
-    print("\n[CHECK] Common finite positive pixels:", n_common)
-
-    if n_common == 0:
-        raise ValueError(
-            "No common positive finite pixels between sim_sar and MLI."
-        )
-
-    # ------------------------------------------------------------
-    # Robust normalization
-    #
-    # This compares spatial structure rather than absolute amplitude.
-    # ------------------------------------------------------------
-
-    sim_norm = robust_standardize(sim_log)
-    mli_norm = robust_standardize(mli_log)
-
-    difference = sim_norm - mli_norm
-
-    difference[~common_valid] = np.nan
-
-    # ------------------------------------------------------------
-    # Simple diagnostic statistics
-    # ------------------------------------------------------------
-
-    sim_values = sim_log[common_valid]
-    mli_values = mli_log[common_valid]
-
-    correlation = np.corrcoef(
-        sim_values,
-        mli_values,
-    )[0, 1]
-
-    print("\n[CHECK] Comparison statistics")
-    print(
-        "        Pearson correlation in log intensity:",
-        float(correlation),
-    )
-
-    print(
-        "        Median observed MLI (dB):",
-        float(np.median(mli_values)),
-    )
-
-    print(
-        "        Median simulated SAR (dB):",
-        float(np.median(sim_values)),
-    )
-
-    # ------------------------------------------------------------
-    # Common display ranges
+    # Shared intensity colour scale
     # ------------------------------------------------------------
 
     combined = np.concatenate([
-        mli_log[common_valid],
-        sim_log[common_valid],
+        mli_filtered_db[
+            common_valid
+        ],
+        sim_scaled_db[
+            common_valid
+        ],
     ])
 
-    vmin = np.nanpercentile(combined, 2)
-    vmax = np.nanpercentile(combined, 98)
+    vmin = float(
+        np.nanpercentile(
+            combined,
+            2,
+        )
+    )
 
-    diff_valid = difference[np.isfinite(difference)]
+    vmax = float(
+        np.nanpercentile(
+            combined,
+            98,
+        )
+    )
 
-    diff_limit = np.nanpercentile(
-        np.abs(diff_valid),
-        98,
+    # ------------------------------------------------------------
+    # Symmetric difference scale
+    # ------------------------------------------------------------
+
+    difference_values = (
+        difference_db[
+            common_valid
+        ]
+    )
+
+    diff_limit = float(
+        np.nanpercentile(
+            np.abs(
+                difference_values
+            ),
+            98,
+        )
     )
 
     # ------------------------------------------------------------
@@ -468,16 +524,25 @@ def compare_simsar_mli(
         constrained_layout=True,
     )
 
+    # Filtered MLI
     im0 = axes[0].pcolormesh(
-        mli_log,
+        mli_filtered_db,
         shading="auto",
         vmin=vmin,
         vmax=vmax,
     )
 
-    axes[0].set_title("Observed MLI")
-    axes[0].set_xlabel("Range pixel")
-    axes[0].set_ylabel("Azimuth line")
+    axes[0].set_title(
+        "MLI — 9×9 median filtered"
+    )
+
+    axes[0].set_xlabel(
+        "Range pixel"
+    )
+
+    axes[0].set_ylabel(
+        "Azimuth line"
+    )
 
     fig.colorbar(
         im0,
@@ -485,16 +550,26 @@ def compare_simsar_mli(
         label="Intensity (dB)",
     )
 
+    # Median-aligned simulated SAR
     im1 = axes[1].pcolormesh(
-        sim_log,
+        sim_scaled_db,
         shading="auto",
         vmin=vmin,
         vmax=vmax,
     )
 
-    axes[1].set_title("Simulated SAR")
-    axes[1].set_xlabel("Range pixel")
-    axes[1].set_ylabel("Azimuth line")
+    axes[1].set_title(
+        "sim_sar — median aligned "
+        f"({median_shift_db:+.2f} dB)"
+    )
+
+    axes[1].set_xlabel(
+        "Range pixel"
+    )
+
+    axes[1].set_ylabel(
+        "Azimuth line"
+    )
 
     fig.colorbar(
         im1,
@@ -502,30 +577,44 @@ def compare_simsar_mli(
         label="Intensity (dB)",
     )
 
+    # Difference
     im2 = axes[2].pcolormesh(
-        difference,
+        difference_db,
         shading="auto",
         vmin=-diff_limit,
         vmax=diff_limit,
         cmap="RdBu_r",
     )
 
-    axes[2].set_title("Normalized difference")
-    axes[2].set_xlabel("Range pixel")
-    axes[2].set_ylabel("Azimuth line")
+    axes[2].set_title(
+        "Adjusted sim_sar − filtered MLI"
+    )
+
+    axes[2].set_xlabel(
+        "Range pixel"
+    )
+
+    axes[2].set_ylabel(
+        "Azimuth line"
+    )
 
     fig.colorbar(
         im2,
         ax=axes[2],
-        label="Robust normalized difference",
+        label="Difference (dB)",
     )
 
-    # Radar rasters normally have azimuth line 0 at the top.
+    # GAMMA radar rasters normally have azimuth line 0 at top
     for ax in axes:
         ax.invert_yaxis()
 
-    if title is not None:
-        fig.suptitle(title)
+    if title is None:
+        title = (
+            "Filtered observed MLI vs "
+            "median-aligned simulated SAR"
+        )
+
+    fig.suptitle(title)
 
     output_png.parent.mkdir(
         parents=True,
@@ -540,46 +629,213 @@ def compare_simsar_mli(
 
     plt.close(fig)
 
-    print("\n[PASS] Comparison plot written:")
-    print("      ", output_png)
+    print(
+        "\n[PASS] Spatial comparison written:"
+    )
+
+    print(
+        "      ",
+        output_png,
+    )
+
+
+def compare_simsar_mli(
+    simsar_tif,
+    mli_tif,
+    output_prefix,
+    *,
+    median_size=15,
+    bins=150,
+):
+    """
+    Full comparison workflow.
+
+    Outputs
+    -------
+    {prefix}_histogram.png
+    {prefix}_spatial.png
+    """
+
+    simsar_tif = Path(
+        simsar_tif
+    )
+
+    mli_tif = Path(
+        mli_tif
+    )
+
+    output_prefix = Path(
+        output_prefix
+    )
+
+    # ------------------------------------------------------------
+    # Read input rasters
+    # ------------------------------------------------------------
+
+    simsar, sim_meta = (
+        read_single_band_tif(
+            simsar_tif
+        )
+    )
+
+    mli, mli_meta = (
+        read_single_band_tif(
+            mli_tif
+        )
+    )
+
+    print(
+        "\n[CHECK] Input raster geometry"
+    )
+
+    print(
+        "        sim_sar shape:",
+        simsar.shape,
+    )
+
+    print(
+        "        MLI shape:    ",
+        mli.shape,
+    )
+
+    # ------------------------------------------------------------
+    # Do NOT silently resample
+    # ------------------------------------------------------------
+
+    if simsar.shape != mli.shape:
+        raise ValueError(
+            "sim_sar and MLI shapes differ. "
+            "No resampling has been performed because "
+            "the radar-coordinate grids should already match."
+        )
+
+    print(
+        "\n[PASS] Raster dimensions match."
+    )
+
+    print(
+        "       No resampling has been performed."
+    )
+
+    # ------------------------------------------------------------
+    # Prepare comparison products
+    # ------------------------------------------------------------
+
+    prepared = (
+        prepare_filtered_mli_and_scaled_simsar(
+            mli,
+            simsar,
+            median_size=median_size,
+        )
+    )
+
+    # ------------------------------------------------------------
+    # Output paths
+    # ------------------------------------------------------------
+
+    histogram_png = Path(
+        str(output_prefix)
+        + "_histogram.png"
+    )
+
+    spatial_png = Path(
+        str(output_prefix)
+        + "_spatial.png"
+    )
+
+    # ------------------------------------------------------------
+    # Histogram
+    # ------------------------------------------------------------
+
+    plot_histogram_comparison(
+        prepared,
+        histogram_png,
+        bins=bins,
+    )
+
+    # ------------------------------------------------------------
+    # Spatial comparison
+    # ------------------------------------------------------------
+
+    plot_spatial_comparison(
+        prepared,
+        spatial_png,
+    )
+
+    print(
+        "\n[DONE] Comparison complete."
+    )
+
+    print(
+        "       Histogram:",
+        histogram_png,
+    )
+
+    print(
+        "       Spatial:  ",
+        spatial_png,
+    )
 
 
 def main():
-
     parser = argparse.ArgumentParser(
         description=(
-            "Compare a GAMMA simulated SAR GeoTIFF "
+            "Compare radar-coordinate simulated SAR "
             "with an observed MLI GeoTIFF."
         )
     )
 
     parser.add_argument(
         "simsar_tif",
-        help="P.{ID}.sim_sar.radar.tif",
+        help=(
+            "Radar-coordinate simulated SAR GeoTIFF, "
+            "e.g. P.001.sim_sar.radar.tif"
+        ),
     )
 
     parser.add_argument(
         "mli_tif",
-        help="Observed MLI GeoTIFF",
+        help=(
+            "Observed MLI GeoTIFF"
+        ),
     )
 
     parser.add_argument(
-        "output_png",
-        help="Output comparison PNG",
+        "output_prefix",
+        help=(
+            "Output prefix. "
+            "Creates *_histogram.png and *_spatial.png"
+        ),
     )
 
     parser.add_argument(
-        "--title",
-        default=None,
+        "--median-size",
+        type=int,
+        default=15,
+        help=(
+            "Median-filter window size in pixels. "
+            "Default: 15"
+        ),
+    )
+
+    parser.add_argument(
+        "--bins",
+        type=int,
+        default=150,
+        help=(
+            "Number of histogram bins. "
+            "Default: 150"
+        ),
     )
 
     args = parser.parse_args()
 
     compare_simsar_mli(
-        args.simsar_tif,
-        args.mli_tif,
-        args.output_png,
-        title=args.title,
+        simsar_tif=args.simsar_tif,
+        mli_tif=args.mli_tif,
+        output_prefix=args.output_prefix,
+        median_size=args.median_size,
+        bins=args.bins,
     )
 
 
