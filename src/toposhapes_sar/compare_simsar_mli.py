@@ -508,9 +508,9 @@ def plot_spatial_comparison(
     # ------------------------------------------------------------
 
     fig, axes = plt.subplots(
+        2,
         1,
-        3,
-        figsize=(16, 6),
+        figsize=(7, 10),
         constrained_layout=True,
     )
 
@@ -568,33 +568,44 @@ def plot_spatial_comparison(
         ax=axes[1],
         label="Intensity (dB)",
     )
+    # add fine grid to both axes every 10 pixels
+    for ax in axes:
+        ax.set_xticks(np.arange(0, sim_scaled_db.shape[1], 10),minor=True)
+        ax.set_yticks(np.arange(0, sim_scaled_db.shape[0], 10),minor=True)
+        
+        ax.grid(
+            which="both",
+            color="lightgray",
+            linestyle="--",
+            linewidth=0.5,
+            alpha=0.5,
+        )
+    # # Difference
+    # im2 = axes[2].pcolormesh(
+    #     difference_db,
+    #     shading="auto",
+    #     vmin=-diff_limit,
+    #     vmax=diff_limit,
+    #     cmap="RdBu_r"
+    # )
 
-    # Difference
-    im2 = axes[2].pcolormesh(
-        difference_db,
-        shading="auto",
-        vmin=-diff_limit,
-        vmax=diff_limit,
-        cmap="RdBu_r"
-    )
+    # axes[2].set_title(
+    #     "Adjusted sim_sar − filtered MLI"
+    # )
 
-    axes[2].set_title(
-        "Adjusted sim_sar − filtered MLI"
-    )
+    # axes[2].set_xlabel(
+    #     "Range pixel"
+    # )
 
-    axes[2].set_xlabel(
-        "Range pixel"
-    )
+    # axes[2].set_ylabel(
+    #     "Azimuth line"
+    # )
 
-    axes[2].set_ylabel(
-        "Azimuth line"
-    )
-
-    fig.colorbar(
-        im2,
-        ax=axes[2],
-        label="Difference (dB)",
-    )
+    # fig.colorbar(
+    #     im2,
+    #     ax=axes[2],
+    #     label="Difference (dB)",
+    # )
 
     # GAMMA radar rasters normally have azimuth line 0 at top
     for ax in axes:
