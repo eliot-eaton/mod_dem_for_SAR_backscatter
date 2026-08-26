@@ -51,6 +51,7 @@ Z_VALUES = [
 # Semi-axes (a, b, c), metres
 SEMI_AXES_VALUES = [
     (100, 200, 140),
+    (1, 1, 1),
 ]
 
 # yaw, pitch, roll in degrees
