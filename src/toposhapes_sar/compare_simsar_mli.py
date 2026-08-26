@@ -552,7 +552,7 @@ def plot_spatial_comparison(
         ],
     ])
 
-    vmin = -20
+    vmin = -40
 
     vmax = 0
 
