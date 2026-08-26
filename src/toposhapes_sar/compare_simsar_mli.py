@@ -164,7 +164,8 @@ def prepare_filtered_mli_and_scaled_simsar(
         mli_filtered
     )
 
-    sim_db = log_intensity(simsar)
+    # add very small value to avoid log10(0) issues 
+    sim_db = log_intensity(simsar+1e-12)
 
     # ------------------------------------------------------------
     # Compare medians only where both filtered MLI and sim_sar
@@ -317,8 +318,9 @@ def plot_histogram_comparison(
 
     # ------------------------------------------------------------
     # Plot
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------
 
+    
     fig, ax = plt.subplots(
         figsize=(9, 6)
     )
@@ -552,7 +554,7 @@ def plot_spatial_comparison(
         ],
     ])
 
-    vmin = -40
+    vmin = -30
 
     vmax = 0
 
@@ -579,6 +581,10 @@ def plot_spatial_comparison(
     # Plot
     # ------------------------------------------------------------
 
+
+    # set nan values to - 50 
+
+    sim_scaled_db = np.where(np.isnan(sim_scaled_db), -50, sim_scaled_db)
     fig, axes = plt.subplots(
         3,
         1,
