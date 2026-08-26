@@ -552,9 +552,9 @@ def plot_spatial_comparison(
         ],
     ])
 
-    vmin = -30
+    vmin = -20
 
-    vmax = 5
+    vmax = 0
 
     # ------------------------------------------------------------
     # Symmetric difference scale
@@ -657,7 +657,7 @@ def plot_spatial_comparison(
             sim_scaled_db,
             use_gradient=True,
         )
-    simsar_edges = np.where(simsar_edges > 0.5, simsar_edges, np.nan)
+    simsar_edges = np.where(simsar_edges > 2, simsar_edges, np.nan)
 
     axes[2].pcolormesh(
             simsar_edges,
