@@ -2,11 +2,10 @@
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
-
 [project]
 name = "toposhapes-sar-dem"
 version = "0.1.0"
-description = "Controlled synthetic DEM modification for GAMMA SAR workflows"
+description = "Controlled synthetic DEM modification for GAMMA SAR/InSAR workflows"
 readme = "README.md"
 requires-python = ">=3.10"
 
@@ -21,7 +20,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-
 interactive = [
   "plotly>=5.18",
   "ipywidgets>=8",
@@ -31,8 +29,11 @@ interactive = [
 test = [
   "pytest>=7",
 ]
-[project.optional-dependencies]
-test = ["pytest>=7"]
+
+[project.scripts]
+toposhapes-gamma-processing = "toposhapes_sar.gamma_processing:main"
+toposhapes-compare-simsar = "toposhapes_sar.compare_simsar_mli:main"
+toposhapes-batch-simsar = "toposhapes_sar.batch_simsar_compare:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -40,7 +41,3 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
-[project.scripts]
-toposhapes-gamma-processing = "toposhapes_sar.gamma_processing:main"
-toposhapes-compare-simsar = "toposhapes_sar.compare_simsar_mli:main"
-toposhapes-batch-simsar = "toposhapes_sar.batch_simsar_compare:main"
