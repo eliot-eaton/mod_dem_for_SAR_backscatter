@@ -17,7 +17,52 @@ from toposhapes_sar import (
 )
 from toposhapes_sar.grid import validate_original_grid
 import numpy as np
+import re
+from pathlib import Path
 
+
+def get_next_run_id(output_dir: Path) -> int:
+    """
+    Find the largest existing P.{ID}.dem in output_dir
+    and return the next integer ID.
+
+    Examples
+    --------
+    No files:
+        -> 1
+
+    P.0001.dem
+    P.0002.dem
+        -> 3
+
+    P.0042.dem
+        -> 43
+    """
+
+    output_dir = Path(output_dir)
+
+    pattern = re.compile(
+        r"^P\.(\d+)\.dem$"
+    )
+
+    existing_ids = []
+
+    for path in output_dir.glob("P.*.dem"):
+
+        match = pattern.match(
+            path.name
+        )
+
+        if match is not None:
+
+            existing_ids.append(
+                int(match.group(1))
+            )
+
+    if not existing_ids:
+        return 1
+
+    return max(existing_ids) + 1
 # =============================================================================
 # USER SETTINGS
 # =============================================================================
@@ -51,6 +96,11 @@ Z_VALUES = [
 # Semi-axes (a, b, c), metres
 SEMI_AXES_VALUES = [
     (100, 100, 50),
+    (100, 100, 100),
+    (100, 100, 150),
+    (150, 150, 50),
+    (150, 150, 100),
+    (150, 150, 150),
     (0.1, 0.1, 0.1),
 ]
 
@@ -176,7 +226,12 @@ print(
 # =============================================================================
 # 5. RUN REALIZATIONS
 # =============================================================================
+start_id = get_next_run_id(OUT)
 
+print(
+    f"        first new run ID = "
+    f"{start_id:04d}"
+)
 for i, (
     shape_x,
     shape_y,
@@ -184,12 +239,16 @@ for i, (
     semi_axes,
     rotation_deg,
 ) in enumerate(
-    parameter_sets,
-    start=1,
+    parameter_sets
 ):
 
-    run_id = f"{i:04d}"
+    numeric_id = (
+        start_id + i
+    )
 
+    run_id = (
+        f"{numeric_id:04d}"
+    )
     print("\n" + "=" * 72)
     print(
         f"[RUN {run_id}] "
