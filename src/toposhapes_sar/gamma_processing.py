@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+"""
+Standalone GAMMA processing for one synthetic DEM.
+
+This file is deliberately kept outside the installed Python package so that
+it can run inside an older/fixed GAMMA + py_gamma environment without
+installing the geo-py dependency stack.
+
+Required Python dependencies:
+- Python standard library
+- py_gamma
+
+Usage:
+python gamma_processing.py \
+    ./mod_dem/synthetic_sweep \
+    0001 \
+    ./slcs/20201226M/20201226.mli.par \
+    --output-dir ./sim_sar
+"""
 
 from __future__ import annotations
 
@@ -19,27 +37,6 @@ def run_gamma_processing(
     lat_ovr=1,
     lon_ovr=1,
 ):
-    """
-    Process one synthetic GAMMA DEM through:
-
-        P.{ID}.dem
-            -> gc_map2
-            -> sim_sar
-            -> radar geometry
-            -> GeoTIFF
-
-    Persistent outputs
-    ------------------
-    P.mapped.{ID}.dem_par
-        Parameter file for the DEM segment created internally by gc_map2.
-
-    P.{ID}.sim_sar.radar.tif
-        Simulated SAR image converted into radar coordinates and written
-        as GeoTIFF.
-
-    All other GAMMA products are temporary.
-    """
-
     input_dir = Path(input_dir).resolve()
     mli_par_path = Path(mli_par_path).resolve()
 
@@ -50,86 +47,42 @@ def run_gamma_processing(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------
-    # Required inputs
-    # ------------------------------------------------------------
-
     dem_path = input_dir / f"P.{run_id}.dem"
     dem_par_path = input_dir / "P.dem_par"
 
-    required = [
-        dem_path,
-        dem_par_path,
-        mli_par_path,
-    ]
+    required = [dem_path, dem_par_path, mli_par_path]
 
     print("\n[CHECK] Required GAMMA inputs")
-
     for path in required:
         print(f"        {path}")
-
         if not path.exists():
             raise FileNotFoundError(path)
 
-    # ------------------------------------------------------------
-    # Persistent outputs
-    # ------------------------------------------------------------
-
-    mapped_dem_par_out = (
-        output_dir / f"P.mapped.{run_id}.dem_par"
-    )
-
-    sim_sar_tif_out = (
-        output_dir / f"P.{run_id}.sim_sar.radar.tif"
-    )
-
-    # ------------------------------------------------------------
-    # Everything else is temporary
-    # ------------------------------------------------------------
+    mapped_dem_par_out = output_dir / f"P.mapped.{run_id}.dem_par"
+    sim_sar_tif_out = output_dir / f"P.{run_id}.sim_sar.radar.tif"
 
     with TemporaryDirectory(prefix=f"gamma_{run_id}_") as tmp:
-
         work = Path(tmp)
 
         print("\n[CHECK] Temporary GAMMA workspace")
         print(f"        {work}")
-        print(
-            "        Intermediate gc_map2/geocode files will "
-            "be deleted after processing."
-        )
 
-        # gc_map2 products
         map_dem_par = work / "mapped.dem_par"
         map_dem = work / "mapped.dem"
-
         lookup = work / "lookup.lt"
-
         ls_map = work / "ls_map"
         ls_map_rdc = work / "ls_map_rdc"
-
         incidence = work / "inc"
         resolution = work / "res"
         offnadir = work / "offnadir"
-
         sim_sar = work / "sim_sar"
-
         u = work / "u"
         v = work / "v"
         psi = work / "psi"
         pix = work / "pix"
 
-        # ========================================================
-        # 1. gc_map2
-        # ========================================================
-
         print("\n[STEP 1] Running gc_map2")
-        print(
-            "         Input DEM is the synthetic P.{ID}.dem."
-        )
-        print(
-            "         DEM oversampling factors:"
-            f" lat={lat_ovr}, lon={lon_ovr}"
-        )
+        print(f"         DEM oversampling: lat={lat_ovr}, lon={lon_ovr}")
 
         pg.gc_map2(
             str(mli_par_path),
@@ -153,93 +106,23 @@ def run_gamma_processing(
         )
 
         if not map_dem_par.exists():
-            raise RuntimeError(
-                "gc_map2 did not create mapped DEM parameter file"
-            )
-
+            raise RuntimeError("gc_map2 did not create mapped DEM parameter file")
         if not sim_sar.exists():
-            raise RuntimeError(
-                "gc_map2 did not create sim_sar"
-            )
+            raise RuntimeError("gc_map2 did not create sim_sar")
 
-        print("\n[PASS] gc_map2 completed")
-        print(
-            f"       sim_sar size: {sim_sar.stat().st_size} bytes"
-        )
-
-        # ========================================================
-        # 2. Save mapped DEM parameter file
-        # ========================================================
-
-        shutil.copy2(
-            map_dem_par,
-            mapped_dem_par_out,
-        )
-
-        print("\n[CHECK] Preserving mapped DEM parameter file")
-        print(f"        {mapped_dem_par_out}")
-
-        # ========================================================
-        # 3. Read map and radar dimensions
-        # ========================================================
+        shutil.copy2(map_dem_par, mapped_dem_par_out)
 
         mapped_par = pg.ParFile(str(map_dem_par))
-
-        map_width = int(
-            mapped_par.get_value("width")
-        )
-
-        map_lines = int(
-            mapped_par.get_value("nlines")
-        )
+        map_width = int(mapped_par.get_value("width"))
+        map_lines = int(mapped_par.get_value("nlines"))
 
         mli_par = pg.ParFile(str(mli_par_path))
+        range_samples = int(mli_par.get_value("range_samples"))
+        azimuth_lines = int(mli_par.get_value("azimuth_lines"))
 
-        range_samples = int(
-            mli_par.get_value("range_samples")
-        )
-
-        azimuth_lines = int(
-            mli_par.get_value("azimuth_lines")
-        )
-
-        print("\n[CHECK] Raster dimensions")
-
-        print(
-            "        sim_sar/map geometry:"
-            f" width={map_width}, lines={map_lines}"
-        )
-
-        print(
-            "        radar geometry:"
-            f" range={range_samples},"
-            f" azimuth={azimuth_lines}"
-        )
-
-        # sim_sar is REAL*4
-        expected_sim_sar_bytes = (
-            map_width * map_lines * 4
-        )
-
-        print(
-            "        expected sim_sar bytes:",
-            expected_sim_sar_bytes,
-        )
-
-        print(
-            "        actual sim_sar bytes:  ",
-            sim_sar.stat().st_size,
-        )
-
+        expected_sim_sar_bytes = map_width * map_lines * 4
         if sim_sar.stat().st_size != expected_sim_sar_bytes:
-            raise RuntimeError(
-                "sim_sar file size does not match "
-                "mapped DEM dimensions"
-            )
-
-        # ========================================================
-        # 4. Map geometry -> radar geometry
-        # ========================================================
+            raise RuntimeError("sim_sar size does not match mapped DEM dimensions")
 
         sim_sar_radar = work / "sim_sar.radar"
 
@@ -257,34 +140,11 @@ def run_gamma_processing(
         )
 
         if not sim_sar_radar.exists():
-            raise RuntimeError(
-                "geocode did not create sim_sar.radar"
-            )
+            raise RuntimeError("geocode did not create sim_sar.radar")
 
-        expected_radar_bytes = (
-            range_samples
-            * azimuth_lines
-            * 4
-        )
-
-        print(
-            "        expected radar bytes:",
-            expected_radar_bytes,
-        )
-
-        print(
-            "        actual radar bytes:  ",
-            sim_sar_radar.stat().st_size,
-        )
-
+        expected_radar_bytes = range_samples * azimuth_lines * 4
         if sim_sar_radar.stat().st_size != expected_radar_bytes:
-            raise RuntimeError(
-                "Radar-coordinate sim_sar size is unexpected"
-            )
-
-        # ========================================================
-        # 5. Radar binary -> GeoTIFF
-        # ========================================================
+            raise RuntimeError("Radar-coordinate sim_sar size is unexpected")
 
         print("\n[STEP 3] Writing radar-coordinate GeoTIFF")
 
@@ -296,19 +156,11 @@ def run_gamma_processing(
         )
 
         if not sim_sar_tif_out.exists():
-            raise RuntimeError(
-                "data2tiff did not create output GeoTIFF"
-            )
+            raise RuntimeError("data2tiff did not create output GeoTIFF")
 
-        print("\n[PASS] GAMMA processing completed")
-
-        print("\nPersistent outputs:")
-        print(f"    {mapped_dem_par_out}")
-        print(f"    {sim_sar_tif_out}")
-
-    # TemporaryDirectory is deleted here.
-
-    print("\n[CHECK] Temporary GAMMA products removed.")
+    print("\n[PASS] GAMMA processing completed")
+    print(f"       {mapped_dem_par_out}")
+    print(f"       {sim_sar_tif_out}")
 
     return {
         "mapped_dem_par": mapped_dem_par_out,
@@ -317,50 +169,15 @@ def run_gamma_processing(
 
 
 def main():
-
     parser = argparse.ArgumentParser(
-        description=(
-            "Generate radar-coordinate simulated SAR from "
-            "a synthetic P.{ID}.dem."
-        )
+        description="Generate radar-coordinate sim_sar for one P.{ID}.dem."
     )
-
-    parser.add_argument(
-        "input_dir",
-        help=(
-            "Directory containing P.{ID}.dem and P.dem_par"
-        ),
-    )
-
-    parser.add_argument(
-        "run_id",
-        help="Synthetic DEM ID, e.g. 001",
-    )
-
-    parser.add_argument(
-        "mli_par",
-        help="Input GAMMA MLI parameter file",
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        default=None,
-        help=(
-            "Output directory. Defaults to input_dir."
-        ),
-    )
-
-    parser.add_argument(
-        "--lat-ovr",
-        type=int,
-        default=1,
-    )
-
-    parser.add_argument(
-        "--lon-ovr",
-        type=int,
-        default=1,
-    )
+    parser.add_argument("input_dir")
+    parser.add_argument("run_id")
+    parser.add_argument("mli_par")
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--lat-ovr", type=int, default=1)
+    parser.add_argument("--lon-ovr", type=int, default=1)
 
     args = parser.parse_args()
 

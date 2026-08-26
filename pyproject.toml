@@ -31,9 +31,8 @@ test = [
 ]
 
 [project.scripts]
-toposhapes-gamma-processing = "toposhapes_sar.gamma_processing:main"
 toposhapes-compare-simsar = "toposhapes_sar.compare_simsar_mli:main"
-toposhapes-batch-simsar = "toposhapes_sar.batch_simsar_compare:main"
+toposhapes-compare-simsar-batch = "toposhapes_sar.compare_simsar_sweep:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

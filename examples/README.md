@@ -1,246 +1,251 @@
-Examples
+# Examples
 
-This directory contains example workflows for modifying a GAMMA P.dem
-with synthetic 3-D geometries and then using the modified DEM to
-generate simulated SAR backscatter with GAMMA.
+This directory demonstrates the recommended `toposhapes-sar-dem` workflow.
 
-Recommended workflow
+The workflow is deliberately split across **two Python environments**:
 
-1.  Explore the DEM interactively to decide where a geometry should be
-    placed and how it should be oriented.
-2.  Create a modified DEM using the chosen geometry parameters.
-3.  Inspect the DEM QA outputs to check that the terrain modification is
-    behaving as intended.
-4.  Run GAMMA processing in a py_gamma environment to generate sim_sar.
-5.  Compare the simulated SAR response with the observed SAR data if
-    required.
+1. **geo-py / normal scientific Python**
+   - inspect the DEM;
+   - use the interactive geometry viewer;
+   - create modified `P.{ID}.dem` files;
+   - compare simulated SAR with observed MLI data.
 
-The original P.dem should be treated as the authoritative DEM. The
-package is designed so that pixels outside the modification footprint
-remain exactly equal to the original DEM.
+2. **GAMMA / py_gamma environment**
+   - run `gc_map2`;
+   - convert `sim_sar` to radar coordinates;
+   - write `P.{ID}.sim_sar.radar.tif`.
 
-1. Explore geometry placement interactively
+The GAMMA environment does **not** need the `toposhapes-sar-dem` package to be
+installed. This is intentional because GAMMA installations often live in fixed
+Python environments that should not be modified.
 
-Start here.
+---
 
-The interactive viewer is intended for choosing: - geometry type; -
-easting and northing; - absolute elevation/depth; - geometry
-dimensions; - yaw, pitch and roll; - interaction with the existing
-terrain.
+## 1. Install in the normal geo-py environment
 
-Available interaction modes include: - fill_to_upper -
-excavate_to_lower - add_thickness - subtract_thickness
+From the repository root:
 
-The viewer displays the original and modified terrain and provides
-east-west and north-south profiles through the centre of the geometry.
-This makes it much easier to understand how a 3-D object intersects the
-existing topography before generating a large parameter sweep.
+```bash
+python -m pip install -e .
+```
 
-Input files
+For tests:
 
-Place the original GAMMA DEM and parameter file in:
+```bash
+python -m pip install -e ".[test]"
+```
 
-./data/P.dem ./data/P.dem_par
+For the interactive viewer:
 
-P.dem is expected to be a GAMMA REAL*4 big-endian DEM.
+```bash
+python -m pip install -e ".[interactive]"
+```
 
-Run the interactive example in Jupyter or VS Code’s notebook interface,
-for example:
+For development with both:
 
-conda activate geo-py jupyter lab
+```bash
+python -m pip install -e ".[test,interactive]"
+```
 
-Open the interactive-viewer notebook and first select a relatively small
-area of the projected DEM.
+The normal package dependencies include NumPy, xarray, rasterio, rioxarray,
+pyproj, Matplotlib and SciPy.
 
-The viewer works in a projected CRS so that geometry dimensions and
-positions are specified directly in metres. Nearest-neighbour
-reprojection is deliberately used when constructing the working
-projected DEM. This avoids interpolating the original elevation values
-unnecessarily.
+The `interactive` extra adds Plotly, ipywidgets and JupyterLab.
 
-What to record
+---
 
-Once a useful geometry has been found, record its parameters, for
-example:
+## 2. Start with the interactive geometry viewer
 
-centre = (432450.0, 350500.0, 2335.0) semi_axes = (75.0, 50.0, 50.0)
-rotation_deg = (20.0, 0.0, 0.0) interaction = “fill_to_upper”
+Use the interactive notebook first to decide:
 
-These parameters can then be transferred directly into a DEM-generation
-script.
+- geometry type;
+- x/y position;
+- absolute z position;
+- dimensions;
+- yaw, pitch and roll;
+- interaction mode.
 
-2. Produce a modified P.dem
+The viewer works on the projected DEM in metres and should show:
 
-The next step is to apply the selected geometry to the full DEM.
+- original or modified 3-D DEM;
+- 50 m elevation contours;
+- east-west and north-south profiles through the shape centre;
+- changed-pixel count;
+- added/removed/net volume.
 
-The interactive viewer is only used to help select the geometry. The
-final modification should be applied to the full-resolution DEM, not
-just the cropped plotting window.
+Once a geometry looks sensible, use those explicit values in a
+single-realization or parameter-sweep script.
 
-A typical realization produces:
+---
 
-P.001.dem 001.json
+## 3. Create modified DEMs in geo-py
 
-where P.001.dem is the modified GAMMA DEM and 001.json records how that
-DEM was produced.
+A sweep directory may look like:
 
-For a parameter sweep this becomes:
+```text
+mod_dem/synthetic_sweep/
+├── P.dem_par
+├── P.0001.dem
+├── 0001.json
+├── P.0002.dem
+├── 0002.json
+└── ...
+```
 
-P.001.dem 001.json P.002.dem 002.json P.003.dem 003.json …
+Each `P.{ID}.dem` is GAMMA REAL*4 big-endian.
 
-The JSON metadata should make each realization reproducible and includes
-information such as geometry type, centre coordinates, dimensions,
-rotation, interaction mode, number of modified pixels, added material
-volume, removed material volume, net DEM volume change, and validation
-information.
+The original `P.dem` grid remains authoritative. Only the intentional
+modification is transferred back to that grid, so unchanged pixels can remain
+exactly equal to the source DEM.
 
-DEM preservation
+---
 
-A key design principle is:
+# GAMMA environment
 
-Only pixels affected by the synthetic geometry should change.
+The GAMMA-side scripts are standalone:
 
-The geographic P.dem grid is therefore retained as the authoritative
-output grid.
+```text
+examples/gamma_processing.py
+examples/gamma_batch.py
+```
 
-The geometry is evaluated in metres on the projected grid, but the
-modification (dz) is transferred back to the original geographic grid.
-The complete modified DEM is not blindly resampled back and forth.
+They intentionally do **not** import `toposhapes_sar`.
 
-This allows unchanged pixels in the final DEM to remain exactly equal to
-their values in the original P.dem.
+They require only:
 
-The output is written using the original GAMMA binary convention:
+- Python standard library;
+- `py_gamma`.
 
-REAL*4 big-endian
+---
 
-QA
+## 4. Process one DEM with GAMMA
 
-Before running GAMMA, inspect the QA plot produced for the realization.
-It should show a small region around the modification, including
-original topography, modified topography, elevation difference and
-contours.
+Activate the existing GAMMA environment, then run:
 
-Also check the printed validation information. A successful realization
-should preserve:
+```bash
+python ../mod_dem_for_SAR_backscatter/examples/gamma_processing.py     ./mod_dem/synthetic_sweep     0001     ./slcs/20201226M/20201226.mli.par     --output-dir ./sim_sar
+```
 
-shape_exact x_exact y_exact transform_exact crs_exact
-unchanged_pixels_exact
+Inputs:
 
-and should not introduce unexpected NaN values.
+```text
+./mod_dem/synthetic_sweep/P.0001.dem
+./mod_dem/synthetic_sweep/P.dem_par
+./slcs/20201226M/20201226.mli.par
+```
 
-3. Generate simulated SAR backscatter with GAMMA
+Persistent outputs:
 
-The next stage requires an environment containing GAMMA and py_gamma.
+```text
+./sim_sar/P.mapped.0001.dem_par
+./sim_sar/P.0001.sim_sar.radar.tif
+```
 
-For example:
+All other GAMMA products are temporary.
 
-conda activate
+---
 
-The important inputs are:
+## 5. Process many IDs with GAMMA
 
-P.001.dem P.dem_par .mli.par
+```bash
+python ../mod_dem_for_SAR_backscatter/examples/gamma_batch.py     ./mod_dem/synthetic_sweep     ./sim_sar     ./slcs/20201226M/20201226.mli.par     0001 0002 0003 0004 0005
+```
 
-P.001.dem is the modified DEM. P.dem_par describes the input geographic
-DEM. .mli.par contains the SAR geometry required by gc_map2.
+Arguments:
 
-Conceptually:
+```text
+gamma_batch.py     DEM_INPUT_DIRECTORY     SIMSAR_OUTPUT_DIRECTORY     MLI_PAR     ID [ID ...]
+```
 
-P.001.dem + P.dem_par + MLI parameter file | v gc_map2 | v P.001.sim_sar
+Existing `P.{ID}.sim_sar.radar.tif` files are skipped.
 
-gc_map2 may create an internal/map DEM with a different extent and shape
-from the input P.dem. This is expected.
+To regenerate them:
 
-The input P.dem was originally constructed with its own frame and
-oversampling choices. Running gc_map2 again determines the DEM segment
-required for the supplied SAR acquisition. The resulting mapped DEM
-should therefore not be interpreted as a replacement for the
-authoritative P.001.dem.
+```bash
+python ../mod_dem_for_SAR_backscatter/examples/gamma_batch.py     ./mod_dem/synthetic_sweep     ./sim_sar     ./slcs/20201226M/20201226.mli.par     0001 0002 0003     --overwrite
+```
 
-The key product for this workflow is:
+After this finishes, leave the GAMMA environment.
 
-P.001.sim_sar
+---
 
-Radar coordinates
+# Back in geo-py
 
-The sim_sar generated by gc_map2 is initially associated with the mapped
-DEM geometry. The GAMMA processing example then uses the lookup table
-generated by gc_map2 to produce the corresponding radar-coordinate
-product.
+## 6. Compare one sim_sar with one MLI
 
-The final simulated SAR can then be exported as a GeoTIFF for subsequent
-analysis and comparison.
+```bash
+toposhapes-compare-simsar     ./sim_sar/P.0001.sim_sar.radar.tif     ./mli_tifs/2020-2021/20201226.mli.tif     ./sim_sar/P.0001.sim_sar.20201226
+```
 
-4. Suggested workflow for many realizations
+This writes:
 
-Once one realization has been tested end-to-end, the same process can be
-used for a parameter sweep.
+```text
+P.0001.sim_sar.20201226_histogram.png
+P.0001.sim_sar.20201226_spatial.png
+```
 
-Useful parameters to sweep include: - x position; - y position; -
-absolute z position; - ellipsoid semi-axes; - trapezoid dimensions; -
-yaw; - pitch; - roll; - interaction mode.
+---
 
-It is strongly recommended to test a small number of realizations
-through the complete DEM -> GAMMA -> sim_sar workflow before launching a
-large parameter sweep.
+## 7. Compare many sim_sar products with one MLI date
 
-5. Recommended order
+```bash
+toposhapes-compare-simsar-batch     ./sim_sar     ./mli_tifs/2020-2021/20201226.mli.tif     0001 0002 0003 0004 0005
+```
 
-A. Interactive geometry viewer Goal: decide where the geometry goes and
-what it should look like.
+Arguments:
 
-B. Single DEM realization Goal: generate one P.{ID}.dem, its JSON
-metadata and QA products, and confirm that the terrain modification is
-correct.
+```text
+toposhapes-compare-simsar-batch     SIMSAR_DIRECTORY     MLI_TIF     ID [ID ...]
+```
 
-C. GAMMA processing Goal: move to a py_gamma environment and produce
-sim_sar for the synthetic topography.
+For each ID, it reads:
 
-D. SAR comparison Goal: compare the resulting simulated SAR with the
-MLI.
+```text
+P.{ID}.sim_sar.radar.tif
+```
 
-E. Parameter sweep Goal: only after the complete workflow works for a
-single DEM, generate many realizations by varying geometry, position and
-orientation.
+and writes:
 
-Important concepts
+```text
+P.{ID}.sim_sar.20201226_histogram.png
+P.{ID}.sim_sar.20201226_spatial.png
+```
 
-Geometry coordinates are in metres
+Existing comparison pairs are skipped.
 
-Geometry construction is performed in a projected CRS. Therefore x, y,
-shape dimensions and vertical geometry parameters are expressed in
-metres.
+To regenerate:
 
-Geometry z is absolute
+```bash
+toposhapes-compare-simsar-batch     ./sim_sar     ./mli_tifs/2020-2021/20201226.mli.tif     0001 0002 0003     --overwrite
+```
 
-The geometry centre elevation can be calculated separately from the
-shape function. This is useful when changing x/y position while
-deliberately keeping the geometry at a fixed absolute z.
+---
 
-The geometry and DEM are separate objects
+## Recommended order
 
-A geometry exists independently of the terrain surface. Its interaction
-mode determines how it modifies the DEM.
+```text
+geo-py
+  |
+  | interactive viewer
+  | generate P.{ID}.dem + {ID}.json
+  v
 
-For example, a deeply buried geometry can still be used with an
-excavation interaction to define a cavity even if the original geometric
-surface does not intersect the terrain.
+GAMMA / py_gamma environment
+  |
+  | examples/gamma_batch.py
+  v
 
-Preserve the original DEM
+P.{ID}.sim_sar.radar.tif
+  |
+  v
 
-The original P.dem is authoritative. Projection is used to make geometry
-calculations physically meaningful in metres. It should not cause
-unnecessary interpolation of terrain outside the modified region.
+geo-py
+  |
+  | toposhapes-compare-simsar-batch
+  v
 
-Keep the JSON metadata
+comparison PNGs
+```
 
-Do not discard the {ID}.json files when running parameter sweeps. They
-provide the link between:
-
-geometry parameters | v P.{ID}.dem | v P.{ID}.sim_sar
-
-Suggested example layout
-
-examples/ |– README.md |– 01_interactive_geometry_viewer.ipynb |–
-02_make_one_realization.py |– 03_make_parameter_sweep.py |–
-04_gamma_processing.py `– 05_compare_simsar_mli.py
+The environment split is intentional: the GAMMA environment stays fixed and
+does not need the scientific Python package installed into it.
