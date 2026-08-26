@@ -2,16 +2,11 @@
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
+
 [project]
 name = "toposhapes-sar-dem"
 version = "0.1.0"
-description = "Controlled synthetic DEM modification for GAMMA SAR/InSAR workflows"
-readme = "README.md"
-requires-python = ">=3.10"
-[project]
-name = "toposhapes-sar-dem"
-version = "0.1.0"
-description = "Controlled synthetic DEM modification for GAMMA SAR/InSAR workflows"
+description = "Controlled synthetic DEM modification for GAMMA SAR workflows"
 readme = "README.md"
 requires-python = ">=3.10"
 
