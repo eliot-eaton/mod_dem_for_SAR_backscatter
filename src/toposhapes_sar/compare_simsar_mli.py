@@ -437,7 +437,79 @@ def plot_spatial_comparison(
     - median-aligned simulated SAR
     - scaled sim_sar - filtered MLI
     """
+    import numpy as np
+    from scipy.ndimage import sobel
 
+
+    def gradient_magnitude(img):
+        """
+        Sobel gradient magnitude without OpenCV.
+        """
+        img = np.asarray(img, dtype=np.float32)
+
+        gx = sobel(
+            img,
+            axis=1,
+            mode="nearest",
+        )
+
+        gy = sobel(
+            img,
+            axis=0,
+            mode="nearest",
+        )
+
+        return np.hypot(gx, gy)
+    def normalize(img, BLUR=True):
+        """
+        Replace NaNs, optionally median-filter, then standardize
+        to zero mean and unit standard deviation.
+        """
+
+        img = np.asarray(img, dtype=np.float32)
+
+        # Match existing behaviour:
+        # replace NaNs with the minimum finite image value
+        img = np.nan_to_num(
+            img,
+            nan=np.nanmin(img),
+        )
+
+        if BLUR:
+            # Equivalent purpose to:
+            # cv2.medianBlur(img.astype(np.float32), 3)
+            img = median_filter(
+                img,
+                size=3,
+                mode="nearest",
+            )
+
+        return (
+            (img - np.mean(img))
+            / (np.std(img) + 1e-6)
+        )
+    def preprocess(img, use_gradient=True):
+
+        # First normalization
+        img = normalize(
+            img,
+            BLUR=True,
+        )
+
+        if use_gradient:
+
+            img = gradient_magnitude(
+                img
+            )
+
+            # Important: gradient values have a new range,
+            # so normalize again afterwards.
+            img = normalize(
+                img,
+                BLUR=False,
+            )
+
+        return img
     output_png = Path(output_png)
 
     mli_filtered_db = prepared[
@@ -508,7 +580,7 @@ def plot_spatial_comparison(
     # ------------------------------------------------------------
 
     fig, axes = plt.subplots(
-        2,
+        3,
         1,
         figsize=(7, 10),
         constrained_layout=True,
@@ -522,6 +594,13 @@ def plot_spatial_comparison(
         vmin=vmin,
         vmax=vmax,
     )
+    im2 = axes[2].pcolormesh(
+            mli_filtered_db,
+            shading="auto",
+            cmap="gray",
+            vmin=vmin,
+            vmax=vmax,
+        )
 
     axes[0].set_title(
         "MLI — 9×9 median filtered"
@@ -538,6 +617,11 @@ def plot_spatial_comparison(
     fig.colorbar(
         im0,
         ax=axes[0],
+        label="Intensity (dB)",
+    )
+    fig.colorbar(
+        im2,
+        ax=axes[2],
         label="Intensity (dB)",
     )
 
@@ -568,6 +652,19 @@ def plot_spatial_comparison(
         ax=axes[1],
         label="Intensity (dB)",
     )
+
+    simsar_edges = preprocess(
+            sim_scaled_db,
+            use_gradient=True,
+        )
+    simsar_edges = np.where(simsar_edges > 0.5, simsar_edges, np.nan)
+
+    axes[2].pcolormesh(
+            simsar_edges,
+            shading="auto",
+            cmap="Reds",
+            vmin=-10,vmax=1,zorder=10
+        )
     # add fine grid to both axes every 10 pixels
     for ax in axes:
         ax.set_xticks(np.arange(0, sim_scaled_db.shape[1], 10),minor=True)
