@@ -1,9 +1,15 @@
 """Synthetic DEM modification for SAR/InSAR experiments."""
 
-from .shapes import RotatedEllipsoid, RotatedCuboid
+from .shapes import RotatedEllipsoid, RotatedCuboid, RotatedTrapezoidalPrism
 from .modify import apply_shape, apply_specs
 
-__all__ = ["RotatedEllipsoid", "RotatedCuboid", "apply_shape", "apply_specs"]
+__all__ = [
+    "RotatedEllipsoid",
+    "RotatedCuboid",
+    "RotatedTrapezoidalPrism",
+    "apply_shape",
+    "apply_specs",
+]
 
 try:
     from .gamma_dem import GammaDEMMetadata, read_gamma_dem, write_gamma_dem

@@ -116,3 +116,390 @@ class RotatedCuboid:
 
     def to_dict(self):
         return {"type":"cuboid", "center_xyz_m":list(map(float,self.center)), "size_m":list(map(float,self.size)), "rotation_deg":list(map(float,self.rotation_deg))}
+@dataclass(frozen=True)
+class RotatedTrapezoidalPrism:
+    """
+    A true 3-D trapezoidal prism with fixed centre (x, y, z).
+
+    The unrotated shape is:
+
+        - trapezoidal in local x-z
+        - constant width along local y
+
+    Parameters
+    ----------
+    center
+        Fixed world centre (x, y, z) in metres.
+
+    bottom_length
+        Full x-length at the lower face.
+
+    top_length
+        Full x-length at the upper face.
+
+    width
+        Full prism width in local y.
+
+    height
+        Full vertical height in local z.
+
+    rotation_deg
+        (yaw, pitch, roll) in degrees.
+    """
+
+    center: tuple[float, float, float]
+
+    bottom_length: float
+    top_length: float
+    width: float
+    height: float
+
+    rotation_deg: tuple[float, float, float] = (
+        0.0,
+        0.0,
+        0.0,
+    )
+
+    def __post_init__(self):
+
+        if (
+            len(self.center) != 3
+            or not np.all(np.isfinite(self.center))
+        ):
+            raise ValueError(
+                "center must be finite (x, y, z)"
+            )
+
+        dimensions = [
+            self.bottom_length,
+            self.top_length,
+            self.width,
+            self.height,
+        ]
+
+        if (
+            not np.all(np.isfinite(dimensions))
+            or any(float(v) <= 0 for v in dimensions)
+        ):
+            raise ValueError(
+                "bottom_length, top_length, width and height "
+                "must all be finite and > 0"
+            )
+
+        if (
+            len(self.rotation_deg) != 3
+            or not np.all(np.isfinite(self.rotation_deg))
+        ):
+            raise ValueError(
+                "rotation_deg must contain three finite values"
+            )
+
+    @property
+    def rotation(self):
+        return rotation_matrix(
+            *self.rotation_deg
+        )
+
+    @property
+    def half_height(self):
+        return float(self.height) / 2.0
+
+    @property
+    def half_width(self):
+        return float(self.width) / 2.0
+
+    def _local_vertices(self):
+        """
+        Return the 8 vertices of the unrotated local prism.
+
+        Bottom is at z=-height/2.
+        Top is at z=+height/2.
+        """
+
+        hb = float(self.bottom_length) / 2.0
+        ht = float(self.top_length) / 2.0
+        hw = self.half_width
+        hz = self.half_height
+
+        return np.array(
+            [
+                # bottom face
+                [-hb, -hw, -hz],
+                [ hb, -hw, -hz],
+                [ hb,  hw, -hz],
+                [-hb,  hw, -hz],
+
+                # top face
+                [-ht, -hw,  hz],
+                [ ht, -hw,  hz],
+                [ ht,  hw,  hz],
+                [-ht,  hw,  hz],
+            ],
+            dtype=float,
+        )
+
+    def bounds_xy(self):
+        """
+        Conservative world x/y bounds from the rotated vertices.
+        """
+
+        cx, cy, cz = map(
+            float,
+            self.center,
+        )
+
+        local = self._local_vertices()
+
+        world = (
+            local @ self.rotation.T
+        )
+
+        world[:, 0] += cx
+        world[:, 1] += cy
+        world[:, 2] += cz
+
+        return (
+            float(world[:, 0].min()),
+            float(world[:, 0].max()),
+            float(world[:, 1].min()),
+            float(world[:, 1].max()),
+        )
+
+    def _inside_local(self, qx, qy, qz):
+        """
+        Test whether local coordinates lie inside the prism.
+
+        At each local z, the allowed x half-length changes linearly
+        from bottom_length/2 to top_length/2.
+        """
+
+        hz = self.half_height
+        hw = self.half_width
+
+        vertical_ok = (
+            (qz >= -hz)
+            & (qz <= hz)
+        )
+
+        width_ok = (
+            np.abs(qy) <= hw
+        )
+
+        # Normalized vertical position:
+        # t=0 at bottom, t=1 at top
+        t = (
+            (qz + hz)
+            / (2.0 * hz)
+        )
+
+        half_bottom = (
+            float(self.bottom_length) / 2.0
+        )
+
+        half_top = (
+            float(self.top_length) / 2.0
+        )
+
+        half_length = (
+            half_bottom
+            + t * (
+                half_top
+                - half_bottom
+            )
+        )
+
+        length_ok = (
+            np.abs(qx)
+            <= half_length
+        )
+
+        return (
+            vertical_ok
+            & width_ok
+            & length_ok
+        )
+
+    def vertical_interval(
+        self,
+        x,
+        y,
+    ):
+        """
+        Return world-z lower/upper intersections of a vertical line
+        with the rotated trapezoidal prism.
+
+        This implementation solves the intersection numerically along
+        each vertical world line. It is deliberately explicit and robust
+        rather than relying on a special-case analytic formula.
+
+        Returns
+        -------
+        lower, upper, valid
+            Arrays matching x/y shape.
+        """
+
+        x, y = np.broadcast_arrays(
+            np.asarray(x, dtype=float),
+            np.asarray(y, dtype=float),
+        )
+
+        cx, cy, cz = map(
+            float,
+            self.center,
+        )
+
+        # Determine conservative possible world-z range from vertices.
+        local_vertices = self._local_vertices()
+
+        world_vertices = (
+            local_vertices
+            @ self.rotation.T
+        )
+
+        zmin = (
+            cz
+            + float(
+                world_vertices[:, 2].min()
+            )
+        )
+
+        zmax = (
+            cz
+            + float(
+                world_vertices[:, 2].max()
+            )
+        )
+
+        # Sample vertical intersections densely enough to bracket
+        # entering/leaving the convex solid.
+        #
+        # This can later be replaced with an analytic half-space
+        # intersection implementation if performance becomes important.
+        nz = 257
+
+        z_samples = np.linspace(
+            zmin,
+            zmax,
+            nz,
+        )
+
+        lower = np.full(
+            x.shape,
+            np.nan,
+            dtype=float,
+        )
+
+        upper = np.full(
+            x.shape,
+            np.nan,
+            dtype=float,
+        )
+
+        valid = np.zeros(
+            x.shape,
+            dtype=bool,
+        )
+
+        rt = self.rotation.T
+
+        for z in z_samples:
+
+            dx = x - cx
+            dy = y - cy
+            dz = z - cz
+
+            qx = (
+                rt[0, 0] * dx
+                + rt[0, 1] * dy
+                + rt[0, 2] * dz
+            )
+
+            qy = (
+                rt[1, 0] * dx
+                + rt[1, 1] * dy
+                + rt[1, 2] * dz
+            )
+
+            qz = (
+                rt[2, 0] * dx
+                + rt[2, 1] * dy
+                + rt[2, 2] * dz
+            )
+
+            inside = self._inside_local(
+                qx,
+                qy,
+                qz,
+            )
+
+            newly_inside = (
+                inside
+                & ~valid
+            )
+
+            lower[newly_inside] = z
+
+            upper[inside] = z
+
+            valid |= inside
+
+        return (
+            lower,
+            upper,
+            valid,
+        )
+
+    def to_dict(self):
+
+        return {
+            "type": "trapezoidal_prism",
+
+            "center_xyz_m": list(
+                map(
+                    float,
+                    self.center,
+                )
+            ),
+
+            "bottom_length_m": float(
+                self.bottom_length
+            ),
+
+            "top_length_m": float(
+                self.top_length
+            ),
+
+            "width_m": float(
+                self.width
+            ),
+
+            "height_m": float(
+                self.height
+            ),
+
+            "rotation_deg": list(
+                map(
+                    float,
+                    self.rotation_deg,
+                )
+            ),
+        }
+
+    def volume_m3(self):
+        """
+        Exact geometric volume of the prism.
+        """
+
+        trapezoid_area = (
+            0.5
+            * (
+                float(self.bottom_length)
+                + float(self.top_length)
+            )
+            * float(self.height)
+        )
+
+        return (
+            trapezoid_area
+            * float(self.width)
+        )

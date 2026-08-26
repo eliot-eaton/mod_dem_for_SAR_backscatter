@@ -47,7 +47,11 @@ def write_run_json(
 
     if qa_outputs:
         payload["qa_outputs"] = {
-            key: Path(value).name
+            key: (
+                None
+                if value is None
+                else Path(value).name
+            )
             for key, value in qa_outputs.items()
         }
 
