@@ -37,7 +37,10 @@ So the result is a vertical-sided excavation with a hemispherical lower floor, e
 ```bash
 python -m pip install -e ".[test]"
 ```
-
+If you would like to use the interactive notebook tool to play with modifying the DEM, please install in interactive mode:
+```bash
+pip install -e ".[interactive,test]"
+```
 ## Run tests with explanatory output
 
 ```bash
