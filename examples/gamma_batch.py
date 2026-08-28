@@ -27,7 +27,59 @@ from gamma_processing import run_gamma_processing
 from pathlib import Path
 
 from pathlib import Path
+def expand_run_ids(run_ids):
+    """
+    Expand run IDs and zero-padded ranges.
 
+    Examples
+    --------
+    ["0040-0050"]
+        -> ["0040", "0041", ..., "0050"]
+
+    ["0001", "0040-0043", "0050"]
+        -> ["0001", "0040", "0041", "0042", "0043", "0050"]
+    """
+
+    # Make sure we always have a list
+    if isinstance(run_ids, (str, int)):
+        run_ids = [run_ids]
+
+    expanded = []
+
+    for item in run_ids:
+
+        item = str(item)
+
+        if "-" in item:
+
+            start_str, end_str = item.split("-", 1)
+
+            start = int(start_str)
+            end = int(end_str)
+
+            if end < start:
+                raise ValueError(
+                    f"Invalid run-ID range '{item}': "
+                    f"end must be >= start."
+                )
+
+            # Preserve zero padding.
+            # max() also safely handles e.g. 0098-0102.
+            pad_width = max(
+                len(start_str),
+                len(end_str),
+            )
+
+            expanded.extend(
+                f"{run_id:0{pad_width}d}"
+                for run_id in range(start, end + 1)
+            )
+
+        else:
+
+            expanded.append(item)
+
+    return expanded
 def run_gamma_batch(
     input_dir,
     output_dir,
@@ -45,36 +97,15 @@ def run_gamma_batch(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if not (input_dir / "P.dem_par").exists():
-        raise FileNotFoundError(input_dir / "P.dem_par")
+        raise FileNotFoundError(
+            input_dir / "P.dem_par"
+        )
+
     if not mli_par.exists():
         raise FileNotFoundError(mli_par)
 
-    # Handle zero-padded string ranges like "0025-0073"
-    if isinstance(run_ids, str) and "-" in run_ids:
-        start_str, end_str = run_ids.split("-")
-        
-        # Capture padding width (e.g., 4 for "0025")
-        pad_width = len(start_str) 
-        
-        start = int(start_str)
-        end = int(end_str)
-        
-        # Generate range and apply the original padding width
-        run_ids = [f"{num:0{pad_width}d}" for num in range(start, end + 1)]
-        
-    # Handle standard lists, tuples, or single inputs
-    else:
-        if isinstance(run_ids, (int, str)):
-            run_ids = [run_ids]
-        elif isinstance(run_ids, tuple) and len(run_ids) == 2:
-            run_ids = list(range(run_ids[0], run_ids[1] + 1))
-            
-        # Convert all standard items to strings
-        run_ids = [str(run_id) for run_id in run_ids]
-    
-
-
-  
+    # Expand IDs such as 0040-0050
+    run_ids = expand_run_ids(run_ids)
 
     successful = []
     skipped = []
@@ -86,16 +117,31 @@ def run_gamma_batch(
     print(f"        MLI parameter file:  {mli_par}")
     print(f"        IDs:                 {' '.join(run_ids)}")
 
-    for index, run_id in enumerate(run_ids, start=1):
+    for index, run_id in enumerate(
+        run_ids,
+        start=1,
+    ):
         print("\n" + "=" * 72)
-        print(f"[GAMMA {run_id}] {index}/{len(run_ids)}")
+        print(
+            f"[GAMMA {run_id}] "
+            f"{index}/{len(run_ids)}"
+        )
         print("=" * 72)
 
-        dem_path = input_dir / f"P.{run_id}.dem"
-        output_tif = output_dir / f"P.{run_id}.sim_sar.radar.tif"
+        dem_path = (
+            input_dir
+            / f"P.{run_id}.dem"
+        )
+
+        output_tif = (
+            output_dir
+            / f"P.{run_id}.sim_sar.radar.tif"
+        )
 
         if not dem_path.exists():
-            print(f"[FAIL] Missing DEM: {dem_path}")
+            print(
+                f"[FAIL] Missing DEM: {dem_path}"
+            )
             failed.append(run_id)
             continue
 
