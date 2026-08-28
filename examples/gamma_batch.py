@@ -26,6 +26,8 @@ from gamma_processing import run_gamma_processing
 
 from pathlib import Path
 
+from pathlib import Path
+
 def run_gamma_batch(
     input_dir,
     output_dir,
@@ -47,22 +49,31 @@ def run_gamma_batch(
     if not mli_par.exists():
         raise FileNotFoundError(mli_par)
 
-    # Handle a string range like "101-105"
+    # Handle zero-padded string ranges like "0025-0073"
     if isinstance(run_ids, str) and "-" in run_ids:
-        start, end = map(int, run_ids.split("-"))
-        run_ids = list(range(start, end + 1))
+        start_str, end_str = run_ids.split("-")
         
-    # Handle a tuple range like (101, 105)
-    elif isinstance(run_ids, tuple) and len(run_ids) == 2:
-        run_ids = list(range(run_ids[0], run_ids[1] + 1))
+        # Capture padding width (e.g., 4 for "0025")
+        pad_width = len(start_str) 
         
-    # Handle a single integer or single string ID passed by mistake
-    elif isinstance(run_ids, (int, str)):
-        run_ids = [run_ids]
-
-    # Convert all generated or provided IDs to strings
-    run_ids = [str(run_id) for run_id in run_ids]
+        start = int(start_str)
+        end = int(end_str)
+        
+        # Generate range and apply the original padding width
+        run_ids = [f"{num:0{pad_width}d}" for num in range(start, end + 1)]
+        
+    # Handle standard lists, tuples, or single inputs
+    else:
+        if isinstance(run_ids, (int, str)):
+            run_ids = [run_ids]
+        elif isinstance(run_ids, tuple) and len(run_ids) == 2:
+            run_ids = list(range(run_ids[0], run_ids[1] + 1))
+            
+        # Convert all standard items to strings
+        run_ids = [str(run_id) for run_id in run_ids]
     
+
+
   
 
     successful = []
