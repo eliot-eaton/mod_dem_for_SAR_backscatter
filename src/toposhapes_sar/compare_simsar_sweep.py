@@ -21,6 +21,60 @@ from pathlib import Path
 
 from .compare_simsar_mli import compare_simsar_mli
 
+def expand_run_ids(run_ids):
+    """
+    Expand run IDs and zero-padded ranges.
+
+    Examples
+    --------
+    ["0040-0050"]
+        -> ["0040", "0041", ..., "0050"]
+
+    ["0001", "0040-0043", "0050"]
+        -> ["0001", "0040", "0041", "0042", "0043", "0050"]
+    """
+
+    # Make sure we always have a list
+    if isinstance(run_ids, (str, int)):
+        run_ids = [run_ids]
+
+    expanded = []
+
+    for item in run_ids:
+
+        item = str(item)
+
+        if "-" in item:
+
+            start_str, end_str = item.split("-", 1)
+
+            start = int(start_str)
+            end = int(end_str)
+
+            if end < start:
+                raise ValueError(
+                    f"Invalid run-ID range '{item}': "
+                    f"end must be >= start."
+                )
+
+            # Preserve zero padding.
+            # max() also safely handles e.g. 0098-0102.
+            pad_width = max(
+                len(start_str),
+                len(end_str),
+            )
+
+            expanded.extend(
+                f"{run_id:0{pad_width}d}"
+                for run_id in range(start, end + 1)
+            )
+
+        else:
+
+            expanded.append(item)
+
+    return expanded
+
 
 def compare_simsar_sweep(
     simsar_dir,
@@ -47,7 +101,7 @@ def compare_simsar_sweep(
     if not mli_tif.exists():
         raise FileNotFoundError(mli_tif)
 
-    run_ids = [str(run_id) for run_id in run_ids]
+    run_ids = expand_run_ids(run_ids)
     mli_date = mli_tif.name.split(".")[0]
 
     successful = []
