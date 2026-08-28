@@ -24,6 +24,8 @@ from pathlib import Path
 from gamma_processing import run_gamma_processing
 
 
+from pathlib import Path
+
 def run_gamma_batch(
     input_dir,
     output_dir,
@@ -45,7 +47,23 @@ def run_gamma_batch(
     if not mli_par.exists():
         raise FileNotFoundError(mli_par)
 
+    # Handle a string range like "101-105"
+    if isinstance(run_ids, str) and "-" in run_ids:
+        start, end = map(int, run_ids.split("-"))
+        run_ids = list(range(start, end + 1))
+        
+    # Handle a tuple range like (101, 105)
+    elif isinstance(run_ids, tuple) and len(run_ids) == 2:
+        run_ids = list(range(run_ids[0], run_ids[1] + 1))
+        
+    # Handle a single integer or single string ID passed by mistake
+    elif isinstance(run_ids, (int, str)):
+        run_ids = [run_ids]
+
+    # Convert all generated or provided IDs to strings
     run_ids = [str(run_id) for run_id in run_ids]
+    
+  
 
     successful = []
     skipped = []
