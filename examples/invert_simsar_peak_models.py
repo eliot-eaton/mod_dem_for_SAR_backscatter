@@ -89,7 +89,7 @@ from scipy.signal import find_peaks
 # =============================================================================
 
 PROFILE_X1 = 775
-PROFILE_X2 = 900
+PROFILE_X2 = 950
 
 PROFILE_LABELS = ("A", "B", "C")
 PROFILE_ROWS = (2030, 2010, 1990)
@@ -100,7 +100,7 @@ RANGE_PIXEL_SPACING_M = 2.728212
 # Local radar-coordinate crop used in the 3 x 5 top-model diagnostic.
 # This keeps the three profile lines and picked peaks large enough to inspect.
 IMAGE_X1 = 750
-IMAGE_X2 = 930
+IMAGE_X2 = 950
 IMAGE_Y1 = 1960
 IMAGE_Y2 = 2060
 
@@ -1954,3 +1954,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
