@@ -2,25 +2,36 @@
 """
 Dense peak-position inversion of modified-DEM SimSAR models against one MLI.
 
-The inversion is evaluated on EVERY azimuth row between the original top and
-bottom profiles (rows 1990..2030 inclusive = 41 radar azimuth lines).  The
-original A/B/C profiles are still the only rows shown in diagnostic plots:
+The inversion can be evaluated on a configurable azimuth corridor.  The
+original A/B/C profiles remain the only rows shown in the profile diagnostic:
 
     A: y=2030, shadow-start x=812
     B: y=2010, shadow-start x=823
     C: y=1990, shadow-start x=826
 
-For intermediate azimuth rows, the post-shadow search-start x coordinate is
-piecewise-linearly interpolated between those three anchors.
+By default the inversion uses rows 1990..2030.  Use --azimuth-min and
+--azimuth-max to extend the inversion beyond A/C.  Shadow-search start x is
+piecewise-linear between A/B/C and linearly extrapolated beyond the end
+anchors using the nearest anchor-pair slope.
 
 Ranking is based ONLY on peak-position error relative to the MEDIAN-FILTERED
 MLI.  Raw MLI peaks are retained as diagnostics but never affect ranking.
 
-SimSAR no-data handling
------------------------
-No-data/NaN pixels are shown as -40 dB in plots.  They are NOT interpolated
-for peak picking.  If a post-shadow profile has data -> no-data -> data, only
-the final contiguous data segment is eligible for the SimSAR peak pick.
+Interaction-aware SimSAR no-data handling
+------------------------------------------
+No-data/NaN pixels are shown as -40 dB in plots.  The special
+"data -> no-data -> data: search only the final data segment" rule is applied
+ONLY to excavation/lowering geometries:
+
+    excavate_to_lower
+    subtract_thickness
+
+For filling/raising geometries (fill_to_upper, add_thickness), the first data
+section is NOT discarded and the normal peak picker is used.
+
+The interaction can be read per model from the existing run JSON via
+--provenance-dir (payload field shapes[*].interaction), or forced for all
+models with --interaction.
 
 Expected SimSAR filenames
 -------------------------
@@ -37,16 +48,20 @@ Main outputs
 
 Example
 -------
-python invert_simsar_peak_models_dense.py \
+python invert_simsar_peak_models_extended_azimuth_interaction.py \
     ./20201226.mli.tif \
     ./sim_sar \
     1 100 \
+    --provenance-dir ./mod_dem/synthetic_sweep \
+    --azimuth-min 1970 \
+    --azimuth-max 2050 \
     --output-dir ./peak_inversion_20201226
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -72,17 +87,27 @@ PLOT_PROFILE_LABELS = ("A", "B", "C")
 PLOT_PROFILE_ROWS = (2030, 2010, 1990)
 PLOT_SHADOW_START_XS = (812, 823, 826)
 
-INVERSION_ROW_MIN = min(PLOT_PROFILE_ROWS)
-INVERSION_ROW_MAX = max(PLOT_PROFILE_ROWS)
+DEFAULT_INVERSION_ROW_MIN = min(PLOT_PROFILE_ROWS)
+DEFAULT_INVERSION_ROW_MAX = max(PLOT_PROFILE_ROWS)
+
+# These globals are configured at run time by _configure_inversion_geometry().
+# Keeping them module-level means the rest of the existing dense-profile code
+# can continue to use one authoritative inversion corridor.
+INVERSION_ROW_MIN = DEFAULT_INVERSION_ROW_MIN
+INVERSION_ROW_MAX = DEFAULT_INVERSION_ROW_MAX
 INVERSION_ROWS = tuple(range(INVERSION_ROW_MIN, INVERSION_ROW_MAX + 1))
 
 RANGE_PIXEL_SPACING_M = 2.728212
 
-# Local image crop for the 3 x 5 diagnostic.
+# Local image crop for the 3 x 5 diagnostic.  The y limits expand
+# automatically if --azimuth-min/--azimuth-max extend beyond this region.
 IMAGE_X1 = 750
 IMAGE_X2 = 930
-IMAGE_Y1 = 1960
-IMAGE_Y2 = 2060
+DEFAULT_IMAGE_Y1 = 1960
+DEFAULT_IMAGE_Y2 = 2060
+IMAGE_Y1 = DEFAULT_IMAGE_Y1
+IMAGE_Y2 = DEFAULT_IMAGE_Y2
+IMAGE_AZIMUTH_PAD = 20
 
 DISPLAY_VMIN_DB = -30.0
 DISPLAY_VMAX_DB = 0.0
@@ -106,23 +131,41 @@ def plot_label_for_row(row: int) -> str:
     return mapping.get(int(row), str(int(row)))
 
 
-def dense_shadow_start_map() -> Dict[int, float]:
-    """
-    Interpolate shadow-search start x for every inversion row.
+def _interp_extrapolate_piecewise(
+    rows: np.ndarray,
+    anchor_rows: np.ndarray,
+    anchor_starts: np.ndarray,
+) -> np.ndarray:
+    """Linear interpolation between anchors and linear extrapolation outside."""
+    order = np.argsort(anchor_rows)
+    xp = np.asarray(anchor_rows, dtype=float)[order]
+    fp = np.asarray(anchor_starts, dtype=float)[order]
+    x = np.asarray(rows, dtype=float)
 
-    The three original profile starts are treated as fixed anchors.  np.interp
-    is linear between anchors; because all inversion rows lie within their
-    y-range, no extrapolation is required.
-    """
+    if xp.size < 2:
+        raise ValueError("At least two shadow-start anchors are required.")
+
+    out = np.interp(x, xp, fp)
+
+    left = x < xp[0]
+    if np.any(left):
+        slope_left = (fp[1] - fp[0]) / (xp[1] - xp[0])
+        out[left] = fp[0] + slope_left * (x[left] - xp[0])
+
+    right = x > xp[-1]
+    if np.any(right):
+        slope_right = (fp[-1] - fp[-2]) / (xp[-1] - xp[-2])
+        out[right] = fp[-1] + slope_right * (x[right] - xp[-1])
+
+    return out
+
+
+def dense_shadow_start_map() -> Dict[int, float]:
+    """Return row-specific shadow-search starts for the active corridor."""
     anchor_rows = np.asarray(PLOT_PROFILE_ROWS, dtype=float)
     anchor_starts = np.asarray(PLOT_SHADOW_START_XS, dtype=float)
-
-    order = np.argsort(anchor_rows)
-    anchor_rows = anchor_rows[order]
-    anchor_starts = anchor_starts[order]
-
     rows = np.asarray(INVERSION_ROWS, dtype=float)
-    starts = np.interp(rows, anchor_rows, anchor_starts)
+    starts = _interp_extrapolate_piecewise(rows, anchor_rows, anchor_starts)
 
     return {
         int(row): float(start)
@@ -130,7 +173,106 @@ def dense_shadow_start_map() -> Dict[int, float]:
     }
 
 
+def _configure_inversion_geometry(azimuth_min: int, azimuth_max: int) -> None:
+    """Configure the dense azimuth corridor and row-specific search starts."""
+    global INVERSION_ROW_MIN, INVERSION_ROW_MAX, INVERSION_ROWS
+    global SHADOW_START_BY_ROW, IMAGE_Y1, IMAGE_Y2
+
+    azimuth_min = int(azimuth_min)
+    azimuth_max = int(azimuth_max)
+
+    if azimuth_min < 0:
+        raise ValueError("azimuth_min must be >= 0.")
+    if azimuth_max < azimuth_min:
+        raise ValueError("azimuth_max must be >= azimuth_min.")
+
+    INVERSION_ROW_MIN = azimuth_min
+    INVERSION_ROW_MAX = azimuth_max
+    INVERSION_ROWS = tuple(range(INVERSION_ROW_MIN, INVERSION_ROW_MAX + 1))
+    SHADOW_START_BY_ROW = dense_shadow_start_map()
+
+    # Ensure the dense picked-edge line remains visible in the image panels.
+    IMAGE_Y1 = min(DEFAULT_IMAGE_Y1, INVERSION_ROW_MIN - IMAGE_AZIMUTH_PAD)
+    IMAGE_Y1 = max(0, IMAGE_Y1)
+    IMAGE_Y2 = max(DEFAULT_IMAGE_Y2, INVERSION_ROW_MAX + IMAGE_AZIMUTH_PAD)
+
+
 SHADOW_START_BY_ROW = dense_shadow_start_map()
+
+
+# =============================================================================
+# MODEL INTERACTION / PROVENANCE
+# =============================================================================
+
+EXCAVATION_INTERACTIONS = {"excavate_to_lower", "subtract_thickness"}
+FILL_INTERACTIONS = {"fill_to_upper", "add_thickness"}
+KNOWN_INTERACTIONS = EXCAVATION_INTERACTIONS | FILL_INTERACTIONS
+
+
+def _read_interactions_from_run_json(path: Path) -> List[str]:
+    """Read unique shapes[*].interaction values from one run provenance JSON."""
+    payload = json.loads(Path(path).read_text())
+    interactions: List[str] = []
+
+    for shape in payload.get("shapes", []):
+        value = shape.get("interaction")
+        if value is not None:
+            value = str(value)
+            if value not in interactions:
+                interactions.append(value)
+
+    return interactions
+
+
+def resolve_model_interaction(
+    run_id: str,
+    *,
+    simsar_dir: Path,
+    interaction: str = "auto",
+    provenance_dir: Optional[Path] = None,
+    provenance_pattern: str = "{id}.json",
+) -> Tuple[str, bool, Optional[Path]]:
+    """
+    Resolve model interaction and whether excavation-specific gap handling applies.
+
+    Returns
+    -------
+    interaction_label, use_excavation_gap_rule, provenance_path
+    """
+    if interaction != "auto":
+        if interaction not in KNOWN_INTERACTIONS:
+            raise ValueError(f"Unknown interaction override: {interaction}")
+        return interaction, interaction in EXCAVATION_INTERACTIONS, None
+
+    candidates: List[Path] = []
+    if provenance_dir is not None:
+        candidates.append(Path(provenance_dir) / provenance_pattern.format(id=run_id))
+    else:
+        # Convenient fallbacks only.  For the repository's usual layout,
+        # --provenance-dir should point to the synthetic DEM/run-JSON directory.
+        candidates.extend([
+            Path(simsar_dir) / provenance_pattern.format(id=run_id),
+            Path(simsar_dir).parent / provenance_pattern.format(id=run_id),
+        ])
+
+    json_path = next((p for p in candidates if p.exists()), None)
+    if json_path is None:
+        # Unknown is deliberately NON-excavation: do not discard the first
+        # valid data segment unless provenance proves the model was excavated.
+        return "unknown", False, None
+
+    interactions = _read_interactions_from_run_json(json_path)
+    if not interactions:
+        return "unknown", False, json_path
+
+    unknown = [x for x in interactions if x not in KNOWN_INTERACTIONS]
+    if unknown:
+        raise ValueError(
+            f"Unknown interaction(s) in {json_path.name}: {', '.join(unknown)}"
+        )
+
+    use_excavation_gap_rule = any(x in EXCAVATION_INTERACTIONS for x in interactions)
+    return "+".join(interactions), use_excavation_gap_rule, json_path
 
 
 # =============================================================================
@@ -385,9 +527,9 @@ def find_post_shadow_peak(
     """
     Find a significant peak after the row-specific shadow search start.
 
-    For SimSAR, set ``respect_internal_nodata_gaps=True``.  If the profile
-    contains data -> no-data -> data after the shadow start, peak picking is
-    restricted to the FINAL contiguous finite-data segment.  Therefore a peak
+    For an EXCAVATED SimSAR, set ``respect_internal_nodata_gaps=True``.  If
+    the profile contains data -> no-data -> data after the shadow start, peak
+    picking is restricted to the FINAL contiguous finite-data segment.  Therefore a peak
     in the first data section can never be selected merely because the signal
     falls into a no-data gap.
 
@@ -1075,15 +1217,27 @@ def run_peak_inversion(
     peak_mode: str = "first",
     min_coverage: float = 1.0,
     top_n: int = 5,
+    azimuth_min: int = DEFAULT_INVERSION_ROW_MIN,
+    azimuth_max: int = DEFAULT_INVERSION_ROW_MAX,
+    interaction: str = "auto",
+    provenance_dir: Optional[Path] = None,
+    provenance_pattern: str = "{id}.json",
 ) -> Dict[str, object]:
+    _configure_inversion_geometry(azimuth_min, azimuth_max)
+
     mli_tif = Path(mli_tif).resolve()
     simsar_dir = Path(simsar_dir).resolve()
     output_dir = Path(output_dir).resolve()
+    provenance_dir = (
+        None if provenance_dir is None else Path(provenance_dir).resolve()
+    )
 
     if not mli_tif.exists():
         raise FileNotFoundError(mli_tif)
     if not simsar_dir.exists():
         raise FileNotFoundError(simsar_dir)
+    if provenance_dir is not None and not provenance_dir.exists():
+        raise FileNotFoundError(provenance_dir)
     if not (0 < min_coverage <= 1.0):
         raise ValueError("min_coverage must be in (0, 1].")
 
@@ -1107,6 +1261,13 @@ def run_peak_inversion(
     print(f"peak mode:              {peak_mode}")
     print(f"minimum model coverage: {min_coverage:.0%}")
     print("ranking basis:          filtered MLI peak positions ONLY")
+    print(f"interaction mode:       {interaction}")
+    if provenance_dir is not None:
+        print(f"provenance directory:   {provenance_dir}")
+    print(
+        "excavation gap rule:    ONLY excavate_to_lower/subtract_thickness; "
+        "fill/addition keep the first data section"
+    )
 
     # ------------------------------------------------------------------
     # Observed MLI
@@ -1177,12 +1338,29 @@ def run_peak_inversion(
 
     for index, run_id in enumerate(run_ids, start=1):
         simsar_tif = simsar_dir / simsar_pattern.format(id=run_id)
-        print(f"  [{index:>4}/{len(run_ids)}] {run_id}: ", end="", flush=True)
+        model_interaction, use_excavation_gap_rule, provenance_path = (
+            resolve_model_interaction(
+                run_id,
+                simsar_dir=simsar_dir,
+                interaction=interaction,
+                provenance_dir=provenance_dir,
+                provenance_pattern=provenance_pattern,
+            )
+        )
+        print(
+            f"  [{index:>4}/{len(run_ids)}] {run_id} "
+            f"[{model_interaction}]: ",
+            end="",
+            flush=True,
+        )
 
         if not simsar_tif.exists():
             print("missing sim_sar")
             score_rows.append({
                 "run_id": run_id,
+                "interaction": model_interaction,
+                "excavation_gap_rule_applied": bool(use_excavation_gap_rule),
+                "provenance_json": None if provenance_path is None else str(provenance_path),
                 "status": "missing_file",
                 "n_rows_total": len(INVERSION_ROWS),
                 "n_rows_observed_valid": n_filtered_obs,
@@ -1212,7 +1390,7 @@ def run_peak_inversion(
                 prominence_db=peak_prominence_db,
                 min_distance_pixels=peak_distance_pixels,
                 peak_mode=peak_mode,
-                respect_internal_nodata_gaps=True,
+                respect_internal_nodata_gaps=use_excavation_gap_rule,
             )
 
             summary, residuals = score_dense_model(
@@ -1221,6 +1399,11 @@ def run_peak_inversion(
                 raw_mli_picks_dense,
                 filtered_mli_picks_dense,
                 min_coverage=min_coverage,
+            )
+            summary["interaction"] = model_interaction
+            summary["excavation_gap_rule_applied"] = bool(use_excavation_gap_rule)
+            summary["provenance_json"] = (
+                None if provenance_path is None else str(provenance_path)
             )
             summary["n_rows_internal_nodata_gap"] = int(internal_gap_rows)
             score_rows.append(summary)
@@ -1233,7 +1416,8 @@ def run_peak_inversion(
                 print(
                     f"dense filtered RMSE {float(summary['rmse_filtered_m']):.2f} m "
                     f"({int(summary['n_rows_matched'])}/{int(summary['n_rows_observed_valid'])} rows; "
-                    f"{int(summary['n_rows_internal_nodata_gap'])} rows with internal no-data gaps)"
+                    f"{int(summary['n_rows_internal_nodata_gap'])} rows with internal no-data gaps; "
+                    f"gap-rule={'ON' if use_excavation_gap_rule else 'OFF'})"
                 )
             else:
                 print(
@@ -1245,6 +1429,9 @@ def run_peak_inversion(
             print(f"failed: {exc}")
             score_rows.append({
                 "run_id": run_id,
+                "interaction": model_interaction,
+                "excavation_gap_rule_applied": bool(use_excavation_gap_rule),
+                "provenance_json": None if provenance_path is None else str(provenance_path),
                 "status": f"error: {exc}",
                 "n_rows_total": len(INVERSION_ROWS),
                 "n_rows_observed_valid": n_filtered_obs,
@@ -1376,7 +1563,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Rank modified DEM models by filtered-MLI post-shadow peak positions "
-            "on every azimuth row between A and C, while plotting only A/B/C."
+            "over a configurable azimuth corridor, while plotting only A/B/C."
         )
     )
     parser.add_argument("mli_tif", type=Path)
@@ -1405,12 +1592,61 @@ def main() -> None:
             "produce a peak to be ranked. Default 1.0 (100%%)."
         ),
     )
+    parser.add_argument(
+        "--azimuth-min",
+        type=int,
+        default=DEFAULT_INVERSION_ROW_MIN,
+        help=(
+            f"First azimuth row used in inversion. Default: {DEFAULT_INVERSION_ROW_MIN}. "
+            "Can extend below profile C."
+        ),
+    )
+    parser.add_argument(
+        "--azimuth-max",
+        type=int,
+        default=DEFAULT_INVERSION_ROW_MAX,
+        help=(
+            f"Last azimuth row used in inversion. Default: {DEFAULT_INVERSION_ROW_MAX}. "
+            "Can extend above profile A."
+        ),
+    )
+    parser.add_argument(
+        "--interaction",
+        choices=(
+            "auto",
+            "excavate_to_lower",
+            "subtract_thickness",
+            "fill_to_upper",
+            "add_thickness",
+        ),
+        default="auto",
+        help=(
+            "Interaction handling. 'auto' reads each model run JSON; otherwise "
+            "force one interaction for all requested IDs."
+        ),
+    )
+    parser.add_argument(
+        "--provenance-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory containing run JSON files (normally the synthetic DEM "
+            "directory). Required for reliable per-model --interaction auto."
+        ),
+    )
+    parser.add_argument(
+        "--provenance-pattern",
+        default="{id}.json",
+        help="Run-JSON filename pattern containing {id}. Default: {id}.json",
+    )
     parser.add_argument("--top-n", type=int, default=5)
 
     args = parser.parse_args()
 
     if "{id}" not in args.simsar_pattern:
         parser.error("--simsar-pattern must contain '{id}'.")
+    if "{id}" not in args.provenance_pattern:
+        parser.error("--provenance-pattern must contain '{id}'.")
 
     run_ids = build_run_ids(args.id_start, args.id_end)
 
@@ -1427,6 +1663,11 @@ def main() -> None:
         peak_mode=args.peak_mode,
         min_coverage=args.min_coverage,
         top_n=args.top_n,
+        azimuth_min=args.azimuth_min,
+        azimuth_max=args.azimuth_max,
+        interaction=args.interaction,
+        provenance_dir=args.provenance_dir,
+        provenance_pattern=args.provenance_pattern,
     )
 
 
