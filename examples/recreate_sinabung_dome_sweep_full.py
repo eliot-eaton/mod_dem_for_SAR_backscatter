@@ -84,13 +84,41 @@ QA_PADDING_M = 500.0
 
 # x values every 10 m from 432400 to 432550 
 X_VALUES = [
+    432400.0,
+    432410.0,
+    432420.0,
+    432430.0,
+    432440.0,
+    432450.0,
+    432460.0,   
+    432470.0,
     432480.0,
+    432490.0,
+    432500.0,
+    432510.0,
+    432520.0,
+    432530.0,
+    432540.0,
+    432550.0
 ]
 
 Y_VALUES = [
-
+    350550.0,
+    350540.0,
+    350530.0,
+    350520.0,
+    350510.0,
     350500.0,
-
+    350490.0,
+    350480.0,
+    350470.0,
+    350460.0,
+    350450.0,
+    350440.0,
+    350430.0,
+    350420.0,
+    350410.0,
+    350400.0
 ]
 
 Z_VALUES = [
@@ -106,17 +134,17 @@ Z_VALUES = [
 ]
 
 # Semi-axes (a, b, c), metres
-SEMI_AXES_VALUES = [(100,100,100)]
+SEMI_AXES_VALUES = []
 
 
-# # loop over lots of values of a, b, c 
-# for a in np.arange(50, 151,5 ):
-#     for b in np.arange(50, 151, 5):
-#         for c in np.arange(50, 151, 5):
+# loop over lots of values of a, b, c 
+for a in np.arange(50, 151,5 ):
+    for b in np.arange(50, 151, 5):
+        for c in np.arange(50, 151, 5):
 
-#             SEMI_AXES_VALUES.append((a, b, c))
+            SEMI_AXES_VALUES.append((a, b, c))
 
-# print(f"        total semi-axes combinations = {len(SEMI_AXES_VALUES)}")
+print(f"        total semi-axes combinations = {len(SEMI_AXES_VALUES)}")
 
 # yaw, pitch, roll in degrees
 ROTATION_VALUES = [

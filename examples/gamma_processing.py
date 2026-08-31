@@ -104,7 +104,7 @@ def run_gamma_processing(
             str(psi),
             str(pix),
         )
-
+        
         if not map_dem_par.exists():
             raise RuntimeError("gc_map2 did not create mapped DEM parameter file")
         if not sim_sar.exists():
