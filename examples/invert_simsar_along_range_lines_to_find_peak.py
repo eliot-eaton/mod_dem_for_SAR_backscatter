@@ -16,6 +16,12 @@ piecewise-linearly interpolated between those three anchors.
 Ranking is based ONLY on peak-position error relative to the MEDIAN-FILTERED
 MLI.  Raw MLI peaks are retained as diagnostics but never affect ranking.
 
+SimSAR no-data handling
+-----------------------
+No-data/NaN pixels are shown as -40 dB in plots.  They are NOT interpolated
+for peak picking.  If a post-shadow profile has data -> no-data -> data, only
+the final contiguous data segment is eligible for the SimSAR peak pick.
+
 Expected SimSAR filenames
 -------------------------
     P.{ID}.sim_sar.radar.tif
@@ -80,6 +86,11 @@ IMAGE_Y2 = 2060
 
 DISPLAY_VMIN_DB = -30.0
 DISPLAY_VMAX_DB = 0.0
+
+# SimSAR no-data pixels are displayed as a deliberately low return.
+# Peak picking still preserves the original no-data mask so gaps cannot
+# manufacture false peaks.
+SIMSAR_NODATA_DB = -40.0
 
 
 @dataclass(frozen=True)
@@ -324,6 +335,7 @@ def read_simsar_dense_profiles(
 
 
 def _interpolate_finite_1d(values: np.ndarray) -> Optional[np.ndarray]:
+    """Interpolate finite values for MLI-only peak picking."""
     values = np.asarray(values, dtype=float)
     finite = np.isfinite(values)
     if finite.sum() < 3:
@@ -335,6 +347,30 @@ def _interpolate_finite_1d(values: np.ndarray) -> Optional[np.ndarray]:
     return out
 
 
+def _finite_runs(mask: np.ndarray) -> List[Tuple[int, int]]:
+    """Return contiguous True runs as half-open (start, stop) index pairs."""
+    mask = np.asarray(mask, dtype=bool)
+    if mask.size == 0 or not np.any(mask):
+        return []
+
+    padded = np.concatenate(([False], mask, [False]))
+    changes = np.diff(padded.astype(np.int8))
+    starts = np.flatnonzero(changes == 1)
+    stops = np.flatnonzero(changes == -1)
+    return [(int(a), int(b)) for a, b in zip(starts, stops)]
+
+
+def has_internal_nodata_gap(
+    profile_db: np.ndarray,
+    *,
+    shadow_start_x: float,
+) -> bool:
+    """True when post-shadow data contain finite -> no-data -> finite structure."""
+    x_pixels = np.arange(PROFILE_X1, PROFILE_X2 + 1, dtype=float)
+    y = np.asarray(profile_db, dtype=float)[x_pixels >= float(shadow_start_x)]
+    return len(_finite_runs(np.isfinite(y))) >= 2
+
+
 def find_post_shadow_peak(
     profile_db: np.ndarray,
     *,
@@ -343,8 +379,21 @@ def find_post_shadow_peak(
     prominence_db: float = 2.0,
     min_distance_pixels: int = 3,
     peak_mode: str = "first",
+    respect_internal_nodata_gaps: bool = False,
+    min_segment_pixels: int = 5,
 ) -> Optional[PeakPick]:
-    """Find a significant peak after the row-specific shadow search start."""
+    """
+    Find a significant peak after the row-specific shadow search start.
+
+    For SimSAR, set ``respect_internal_nodata_gaps=True``.  If the profile
+    contains data -> no-data -> data after the shadow start, peak picking is
+    restricted to the FINAL contiguous finite-data segment.  Therefore a peak
+    in the first data section can never be selected merely because the signal
+    falls into a no-data gap.
+
+    No-data is *not* interpolated for SimSAR.  It is preserved as a mask for
+    picking and is only replaced by SIMSAR_NODATA_DB for plotting.
+    """
     if peak_mode not in {"first", "most_prominent"}:
         raise ValueError("peak_mode must be 'first' or 'most_prominent'.")
 
@@ -360,9 +409,23 @@ def find_post_shadow_peak(
     x = x_pixels[search]
     y = profile_db[search]
 
-    y_work = _interpolate_finite_1d(y)
-    if y_work is None:
-        return None
+    if respect_internal_nodata_gaps:
+        runs = _finite_runs(np.isfinite(y))
+        if not runs:
+            return None
+
+        # Critical behaviour: if there is data -> no-data -> data, discard
+        # every earlier data section and search ONLY the final data segment.
+        start, stop = runs[-1]
+        if (stop - start) < max(3, int(min_segment_pixels)):
+            return None
+
+        x = x[start:stop]
+        y_work = np.asarray(y[start:stop], dtype=float)
+    else:
+        y_work = _interpolate_finite_1d(y)
+        if y_work is None:
+            return None
 
     if peak_sigma > 0:
         y_smooth = gaussian_filter1d(y_work, sigma=peak_sigma, mode="nearest")
@@ -398,6 +461,7 @@ def pick_dense_profile_set(
     prominence_db: float,
     min_distance_pixels: int,
     peak_mode: str,
+    respect_internal_nodata_gaps: bool = False,
 ) -> Dict[int, Optional[PeakPick]]:
     """Pick a post-shadow peak on every inversion azimuth row."""
     picks: Dict[int, Optional[PeakPick]] = {}
@@ -410,6 +474,7 @@ def pick_dense_profile_set(
             prominence_db=prominence_db,
             min_distance_pixels=min_distance_pixels,
             peak_mode=peak_mode,
+            respect_internal_nodata_gaps=respect_internal_nodata_gaps,
         )
 
     return picks
@@ -708,7 +773,12 @@ def plot_top_models(
             ax = axes[r, col]
             raw = raw_mli_profiles[label]
             filt = filtered_mli_profiles[label]
-            sim = sim_profiles[label] + display_shift
+            sim_raw = np.asarray(sim_profiles[label], dtype=float)
+            sim = np.where(
+                np.isfinite(sim_raw),
+                sim_raw + display_shift,
+                SIMSAR_NODATA_DB,
+            )
 
             ax.plot(x, raw, linewidth=0.8, alpha=0.45,
                     label="MLI raw" if (r == 0 and col == 0) else None)
@@ -801,7 +871,11 @@ def plot_top5_image_profile_summary(
         sim_profiles = sim_profiles_by_id[run_id]
         sim_picks = sim_picks_by_id[run_id]
         display_shift = _display_shift_to_filtered_mli(sim_profiles, filtered_mli_profiles)
-        sim_crop_display = sim_crop_db + display_shift
+        sim_crop_display = np.where(
+            np.isfinite(sim_crop_db),
+            sim_crop_db + display_shift,
+            SIMSAR_NODATA_DB,
+        )
 
         # Top row: SimSAR image with the full dense picked edge.
         ax = axes[0, col]
@@ -902,7 +976,12 @@ def plot_top5_image_profile_summary(
             color = colors[label]
             raw = np.asarray(raw_mli_profiles[label], dtype=float)
             filt = np.asarray(filtered_mli_profiles[label], dtype=float)
-            sim = np.asarray(sim_profiles[label], dtype=float) + display_shift
+            sim_raw = np.asarray(sim_profiles[label], dtype=float)
+            sim = np.where(
+                np.isfinite(sim_raw),
+                sim_raw + display_shift,
+                SIMSAR_NODATA_DB,
+            )
             raw_pick = raw_mli_picks[label]
             filt_pick = filtered_mli_picks[label]
             sim_pick = sim_picks[label]
@@ -1113,17 +1192,27 @@ def run_peak_inversion(
                 "mae_filtered_m": np.nan,
                 "bias_filtered_m": np.nan,
                 "rmse_raw_m": np.nan,
+                "n_rows_internal_nodata_gap": np.nan,
             })
             continue
 
         try:
             sim_dense = read_simsar_dense_profiles(simsar_tif, expected_shape=mli_shape)
+            internal_gap_rows = sum(
+                has_internal_nodata_gap(
+                    sim_dense[row],
+                    shadow_start_x=SHADOW_START_BY_ROW[row],
+                )
+                for row in INVERSION_ROWS
+            )
+
             sim_picks_dense = pick_dense_profile_set(
                 sim_dense,
                 peak_sigma=peak_sigma,
                 prominence_db=peak_prominence_db,
                 min_distance_pixels=peak_distance_pixels,
                 peak_mode=peak_mode,
+                respect_internal_nodata_gaps=True,
             )
 
             summary, residuals = score_dense_model(
@@ -1133,6 +1222,7 @@ def run_peak_inversion(
                 filtered_mli_picks_dense,
                 min_coverage=min_coverage,
             )
+            summary["n_rows_internal_nodata_gap"] = int(internal_gap_rows)
             score_rows.append(summary)
             all_residual_rows.extend(residuals)
 
@@ -1142,7 +1232,8 @@ def run_peak_inversion(
                 sim_dense_picks_by_id[run_id] = dict(sim_picks_dense)
                 print(
                     f"dense filtered RMSE {float(summary['rmse_filtered_m']):.2f} m "
-                    f"({int(summary['n_rows_matched'])}/{int(summary['n_rows_observed_valid'])} rows)"
+                    f"({int(summary['n_rows_matched'])}/{int(summary['n_rows_observed_valid'])} rows; "
+                    f"{int(summary['n_rows_internal_nodata_gap'])} rows with internal no-data gaps)"
                 )
             else:
                 print(
@@ -1163,6 +1254,7 @@ def run_peak_inversion(
                 "mae_filtered_m": np.nan,
                 "bias_filtered_m": np.nan,
                 "rmse_raw_m": np.nan,
+                "n_rows_internal_nodata_gap": np.nan,
             })
 
     ranking = pd.DataFrame(score_rows)
