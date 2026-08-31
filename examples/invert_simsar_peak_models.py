@@ -1,4 +1,4 @@
-
+#!/usr/bin/env python3
 """
 Rank modified DEM models by post-shadow SAR peak position.
 
@@ -40,10 +40,16 @@ For each model the script reports:
 By default the inversion is ranked by the FILTERED MLI RMSE.  This is more
 defensible than treating raw and filtered versions of the same observation as
 independent data.  Use --rank-by raw or --rank-by combined for sensitivity
-tests.  The top five models under the selected ranking are plotted in a 3 x 5
-profile figure.
-The simulated curves are median-shifted in dB FOR DISPLAY ONLY; this shift does
-not affect peak locations or model scores.
+tests.  The top five models under the selected ranking are plotted in two diagnostics:
+
+1. The existing A/B/C profile comparison figure.
+2. A 3-row x 5-column model summary figure:
+   - top row: simulated SAR crop with A/B/C picked peaks
+   - middle row: observed MLI crop with raw + filtered A/B/C picked peaks
+   - bottom row: observed and simulated A/B/C intensity profiles with picked peaks
+
+The simulated curves/images are median-shifted in dB FOR DISPLAY ONLY; this
+shift does not affect peak locations or model scores.
 
 Dependencies
 ------------
@@ -90,6 +96,17 @@ PROFILE_ROWS = (2030, 2010, 1990)
 SHADOW_START_XS = (812, 823, 826)
 
 RANGE_PIXEL_SPACING_M = 2.728212
+
+# Local radar-coordinate crop used in the 3 x 5 top-model diagnostic.
+# This keeps the three profile lines and picked peaks large enough to inspect.
+IMAGE_X1 = 750
+IMAGE_X2 = 930
+IMAGE_Y1 = 1960
+IMAGE_Y2 = 2060
+
+# Display scale only. Peak picking/ranking is performed on the unshifted dB data.
+DISPLAY_VMIN_DB = -30.0
+DISPLAY_VMAX_DB = 0.0
 
 
 @dataclass(frozen=True)
@@ -343,6 +360,56 @@ def read_simsar_profiles(
         label: log_intensity(values + 1e-12)
         for label, values in profiles_linear.items()
     }
+
+
+def read_radar_crop_db(
+    path: Path,
+    *,
+    expected_shape: Optional[Tuple[int, int]] = None,
+    add_epsilon: bool = False,
+) -> np.ndarray:
+    """
+    Read the fixed local image crop used by the 3 x 5 diagnostic and convert to dB.
+
+    The returned array corresponds to absolute radar pixels
+    x=IMAGE_X1..IMAGE_X2 and y=IMAGE_Y1..IMAGE_Y2 inclusive.
+    """
+
+    path = Path(path)
+
+    with rasterio.open(path) as src:
+        shape = (src.height, src.width)
+
+        if expected_shape is not None and shape != expected_shape:
+            raise ValueError(
+                f"Raster shape differs from MLI: {shape} != {expected_shape}"
+            )
+
+        if IMAGE_X2 >= src.width or IMAGE_Y2 >= src.height:
+            raise ValueError(
+                "Requested diagnostic crop falls outside raster: "
+                f"x={IMAGE_X1}..{IMAGE_X2}, y={IMAGE_Y1}..{IMAGE_Y2}, "
+                f"shape={shape}."
+            )
+
+        window = Window(
+            col_off=IMAGE_X1,
+            row_off=IMAGE_Y1,
+            width=IMAGE_X2 - IMAGE_X1 + 1,
+            height=IMAGE_Y2 - IMAGE_Y1 + 1,
+        )
+
+        arr = src.read(1, window=window, masked=True)
+
+    if np.ma.isMaskedArray(arr):
+        linear = arr.filled(np.nan).astype(np.float32)
+    else:
+        linear = np.asarray(arr, dtype=np.float32)
+
+    if add_epsilon:
+        linear = linear + 1e-12
+
+    return log_intensity(linear)
 
 
 # =============================================================================
@@ -862,6 +929,422 @@ def plot_top_models(
     plt.close(fig)
 
 
+
+def _profile_value_at_pick(profile: np.ndarray, pick: PeakPick) -> float:
+    """Return the displayed profile value at a picked absolute range pixel."""
+
+    idx = int(round(pick.x_pixel - PROFILE_X1))
+
+    if idx < 0 or idx >= len(profile):
+        return np.nan
+
+    value = float(profile[idx])
+    return value if np.isfinite(value) else np.nan
+
+
+def plot_top5_image_profile_summary(
+    top_models: pd.DataFrame,
+    simsar_dir: Path,
+    simsar_pattern: str,
+    mli_tif: Path,
+    expected_shape: Tuple[int, int],
+    sim_profiles_by_id: Mapping[str, Mapping[str, np.ndarray]],
+    raw_mli_profiles: Mapping[str, np.ndarray],
+    filtered_mli_profiles: Mapping[str, np.ndarray],
+    raw_mli_picks: Mapping[str, Optional[PeakPick]],
+    filtered_mli_picks: Mapping[str, Optional[PeakPick]],
+    sim_picks_by_id: Mapping[str, Mapping[str, Optional[PeakPick]]],
+    output_png: Path,
+    *,
+    ranking_metric: str,
+    ranking_label: str,
+) -> None:
+    """
+    Create the requested 3-row x 5-column top-model diagnostic.
+
+    Columns
+    -------
+    One column per ranked model (up to the best five).
+
+    Rows
+    ----
+    1. Simulated SAR image crop with A/B/C profile lines and simulated picks.
+    2. Actual observed MLI crop with A/B/C profile lines and both raw and
+       median-filtered MLI peak picks.
+    3. A/B/C intensity profiles: raw MLI, filtered MLI, and simulated SAR,
+       including the corresponding picked peaks.
+
+    Notes
+    -----
+    The simulated SAR is shifted in dB only for display. The peak coordinates
+    and inversion scores were already calculated from the unshifted SimSAR.
+    """
+
+    if top_models.empty:
+        raise RuntimeError("No valid models are available for the 3 x 5 plot.")
+
+    # This diagnostic is deliberately fixed to five columns maximum.
+    models = top_models.head(5).copy()
+    nmodels = len(models)
+
+    mli_crop_db = read_radar_crop_db(
+        Path(mli_tif),
+        expected_shape=expected_shape,
+        add_epsilon=False,
+    )
+
+    fig, axes = plt.subplots(
+        3,
+        nmodels,
+        figsize=(4.2 * nmodels, 11.2),
+        squeeze=False,
+    )
+
+    # Use Matplotlib's active property cycle so A/B/C remain consistent without
+    # hard-coding a palette.
+    cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+    if len(cycle) < 3:
+        cycle = [f"C{i}" for i in range(3)]
+
+    profile_colors = {
+        label: cycle[i]
+        for i, label in enumerate(PROFILE_LABELS)
+    }
+
+    x = np.arange(PROFILE_X1, PROFILE_X2 + 1)
+
+    for col, (_, model) in enumerate(models.iterrows()):
+
+        run_id = str(model["run_id"])
+        simsar_tif = Path(simsar_dir) / simsar_pattern.format(id=run_id)
+
+        sim_crop_db = read_radar_crop_db(
+            simsar_tif,
+            expected_shape=expected_shape,
+            add_epsilon=True,
+        )
+
+        sim_profiles = sim_profiles_by_id[run_id]
+        sim_picks = sim_picks_by_id[run_id]
+
+        display_shift = _display_shift_to_filtered_mli(
+            sim_profiles,
+            filtered_mli_profiles,
+        )
+
+        sim_crop_display = sim_crop_db + display_shift
+
+        # ------------------------------------------------------------------
+        # ROW 1 — simulated SAR image with picked peaks
+        # ------------------------------------------------------------------
+
+        ax_sim = axes[0, col]
+
+        ax_sim.imshow(
+            sim_crop_display,
+            cmap="gray",
+            vmin=DISPLAY_VMIN_DB,
+            vmax=DISPLAY_VMAX_DB,
+            origin="upper",
+            extent=[
+                IMAGE_X1,
+                IMAGE_X2 + 1,
+                IMAGE_Y2 + 1,
+                IMAGE_Y1,
+            ],
+            interpolation="nearest",
+        )
+
+        for label, row_y in zip(PROFILE_LABELS, PROFILE_ROWS):
+
+            color = profile_colors[label]
+            pick = sim_picks[label]
+            assert pick is not None
+
+            ax_sim.plot(
+                [PROFILE_X1, PROFILE_X2],
+                [row_y, row_y],
+                linewidth=1.0,
+                color=color,
+            )
+
+            ax_sim.scatter(
+                pick.x_pixel,
+                row_y,
+                s=52,
+                marker="o",
+                facecolors="none",
+                edgecolors=color,
+                linewidths=1.6,
+                zorder=5,
+            )
+
+            ax_sim.text(
+                PROFILE_X1 + 2,
+                row_y - 2,
+                label,
+                color=color,
+                fontsize=8,
+                fontweight="bold",
+                va="bottom",
+            )
+
+        ax_sim.set_xlim(IMAGE_X1, IMAGE_X2)
+        ax_sim.set_ylim(IMAGE_Y2, IMAGE_Y1)
+        ax_sim.set_aspect("equal")
+
+        ax_sim.set_title(
+            f"Rank {int(model['rank_selected'])}: P.{run_id}.dem\n"
+            f"{ranking_label} RMSE = {model[ranking_metric]:.2f} m",
+            fontsize=9,
+        )
+
+        if col == 0:
+            ax_sim.set_ylabel("SimSAR\nAzimuth line")
+        else:
+            ax_sim.set_yticklabels([])
+
+        # ------------------------------------------------------------------
+        # ROW 2 — actual MLI with raw and filtered picked peaks
+        # ------------------------------------------------------------------
+
+        ax_mli = axes[1, col]
+
+        ax_mli.imshow(
+            mli_crop_db,
+            cmap="gray",
+            vmin=DISPLAY_VMIN_DB,
+            vmax=DISPLAY_VMAX_DB,
+            origin="upper",
+            extent=[
+                IMAGE_X1,
+                IMAGE_X2 + 1,
+                IMAGE_Y2 + 1,
+                IMAGE_Y1,
+            ],
+            interpolation="nearest",
+        )
+
+        for label, row_y in zip(PROFILE_LABELS, PROFILE_ROWS):
+
+            color = profile_colors[label]
+            raw_pick = raw_mli_picks[label]
+            filt_pick = filtered_mli_picks[label]
+
+            assert raw_pick is not None
+            assert filt_pick is not None
+
+            ax_mli.plot(
+                [PROFILE_X1, PROFILE_X2],
+                [row_y, row_y],
+                linewidth=1.0,
+                color=color,
+            )
+
+            # Open circle = raw MLI pick.
+            ax_mli.scatter(
+                raw_pick.x_pixel,
+                row_y,
+                s=52,
+                marker="o",
+                facecolors="none",
+                edgecolors=color,
+                linewidths=1.5,
+                zorder=5,
+            )
+
+            # x = median-filtered MLI pick.
+            ax_mli.scatter(
+                filt_pick.x_pixel,
+                row_y,
+                s=44,
+                marker="x",
+                color=color,
+                linewidths=1.6,
+                zorder=6,
+            )
+
+            ax_mli.text(
+                PROFILE_X1 + 2,
+                row_y - 2,
+                label,
+                color=color,
+                fontsize=8,
+                fontweight="bold",
+                va="bottom",
+            )
+
+        ax_mli.set_xlim(IMAGE_X1, IMAGE_X2)
+        ax_mli.set_ylim(IMAGE_Y2, IMAGE_Y1)
+        ax_mli.set_aspect("equal")
+        ax_mli.set_xlabel("Range pixel")
+
+        if col == 0:
+            ax_mli.set_ylabel("Observed MLI\nAzimuth line")
+        else:
+            ax_mli.set_yticklabels([])
+
+        # ------------------------------------------------------------------
+        # ROW 3 — profile intensity comparison with peak markers
+        # ------------------------------------------------------------------
+
+        ax_prof = axes[2, col]
+
+        error_lines = []
+
+        for label in PROFILE_LABELS:
+
+            color = profile_colors[label]
+
+            raw = np.asarray(raw_mli_profiles[label], dtype=float)
+            filt = np.asarray(filtered_mli_profiles[label], dtype=float)
+            sim = np.asarray(sim_profiles[label], dtype=float) + display_shift
+
+            raw_pick = raw_mli_picks[label]
+            filt_pick = filtered_mli_picks[label]
+            sim_pick = sim_picks[label]
+
+            assert raw_pick is not None
+            assert filt_pick is not None
+            assert sim_pick is not None
+
+            # Raw MLI is intentionally faint: filtered MLI is the default
+            # inversion reference, but this keeps the raw comparison visible.
+            ax_prof.plot(
+                x,
+                raw,
+                color=color,
+                linewidth=0.75,
+                linestyle=":",
+                alpha=0.45,
+            )
+
+            ax_prof.plot(
+                x,
+                filt,
+                color=color,
+                linewidth=1.25,
+                linestyle="-",
+            )
+
+            ax_prof.plot(
+                x,
+                sim,
+                color=color,
+                linewidth=1.05,
+                linestyle="--",
+            )
+
+            raw_y = _profile_value_at_pick(raw, raw_pick)
+            filt_y = _profile_value_at_pick(filt, filt_pick)
+            sim_y = _profile_value_at_pick(sim, sim_pick)
+
+            if np.isfinite(raw_y):
+                ax_prof.scatter(
+                    raw_pick.x_pixel,
+                    raw_y,
+                    s=24,
+                    marker="o",
+                    facecolors="none",
+                    edgecolors=color,
+                    linewidths=1.0,
+                    zorder=5,
+                )
+
+            if np.isfinite(filt_y):
+                ax_prof.scatter(
+                    filt_pick.x_pixel,
+                    filt_y,
+                    s=28,
+                    marker="x",
+                    color=color,
+                    linewidths=1.2,
+                    zorder=6,
+                )
+
+            if np.isfinite(sim_y):
+                ax_prof.scatter(
+                    sim_pick.x_pixel,
+                    sim_y,
+                    s=34,
+                    marker="s",
+                    facecolors="none",
+                    edgecolors=color,
+                    linewidths=1.2,
+                    zorder=7,
+                )
+
+            # Main error uses the filtered MLI pick because filtered ranking is
+            # the recommended/default inversion mode.
+            error_m = (
+                sim_pick.x_pixel - filt_pick.x_pixel
+            ) * RANGE_PIXEL_SPACING_M
+
+            error_lines.append(f"{label}: {error_m:+.1f} m")
+
+        ax_prof.set_xlim(PROFILE_X1, PROFILE_X2)
+        ax_prof.grid(alpha=0.18, linewidth=0.5)
+        ax_prof.set_xlabel("Range pixel")
+
+        if col == 0:
+            ax_prof.set_ylabel("Profile intensity (dB)")
+
+        ax_prof.text(
+            0.02,
+            0.03,
+            "Peak error vs filtered MLI\n" + "  ".join(error_lines),
+            transform=ax_prof.transAxes,
+            fontsize=7.5,
+            va="bottom",
+            ha="left",
+            bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
+        )
+
+    # ----------------------------------------------------------------------
+    # Figure-level legend
+    # ----------------------------------------------------------------------
+
+    from matplotlib.lines import Line2D
+
+    source_handles = [
+        Line2D([0], [0], linestyle=":", linewidth=1.0, label="MLI raw profile"),
+        Line2D([0], [0], linestyle="-", linewidth=1.3, label="MLI median-filtered profile"),
+        Line2D([0], [0], linestyle="--", linewidth=1.1, label="SimSAR profile (display shifted)"),
+        Line2D([0], [0], marker="o", linestyle="None", markerfacecolor="none", label="Raw MLI peak"),
+        Line2D([0], [0], marker="x", linestyle="None", label="Filtered MLI peak"),
+        Line2D([0], [0], marker="s", linestyle="None", markerfacecolor="none", label="SimSAR peak"),
+    ]
+
+    fig.legend(
+        handles=source_handles,
+        loc="upper center",
+        ncol=6,
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.962),
+        fontsize=8,
+    )
+
+    fig.suptitle(
+        "Top-five peak-position model comparison\n"
+        "Top: simulated SAR; middle: observed MLI; bottom: A/B/C intensity profiles",
+        fontsize=12,
+        y=0.995,
+    )
+
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93), h_pad=1.0, w_pad=0.6)
+
+    output_png = Path(output_png)
+    output_png.parent.mkdir(parents=True, exist_ok=True)
+
+    fig.savefig(
+        output_png,
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.close(fig)
+
+
 def plot_observed_mli_profiles(
     raw_profiles: Mapping[str, np.ndarray],
     filtered_profiles: Mapping[str, np.ndarray],
@@ -1261,6 +1744,25 @@ def run_peak_inversion(
         ranking_label=ranking_label,
     )
 
+    top_3x5_png = output_dir / "top5_3x5_image_mli_profile_comparison.png"
+
+    plot_top5_image_profile_summary(
+        top_models,
+        simsar_dir,
+        simsar_pattern,
+        mli_tif,
+        mli_shape,
+        sim_profiles_by_id,
+        raw_mli_profiles,
+        filtered_mli_profiles,
+        raw_mli_picks,
+        filtered_mli_picks,
+        sim_picks_by_id,
+        top_3x5_png,
+        ranking_metric=ranking_metric,
+        ranking_label=ranking_label,
+    )
+
     # -------------------------------------------------------------------------
     # Summary
     # -------------------------------------------------------------------------
@@ -1295,6 +1797,7 @@ def run_peak_inversion(
     print(f"  {observed_png}")
     print(f"  {ranking_csv}")
     print(f"  {top_png}")
+    print(f"  {top_3x5_png}")
 
     return {
         "best_run_id": str(best["run_id"]),
@@ -1305,6 +1808,7 @@ def run_peak_inversion(
         "observed_peaks": observed_df,
         "ranking_csv": ranking_csv,
         "top5_plot": top_png,
+        "top5_3x5_plot": top_3x5_png,
     }
 
 
