@@ -16,16 +16,40 @@ python gamma_processing.py \
     0001 \
     ./slcs/20201226M/20201226.mli.par \
     --output-dir ./sim_sar
+
+Persistent outputs are committed atomically: GAMMA writes to uniquely named
+staging files first, and those files replace the final output paths only after
+successful validation. This is especially useful when several IDs are being
+processed concurrently by gamma_batch.py.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
+import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import py_gamma as pg
+
+
+def _atomic_copy(source, destination):
+    """Copy source to a same-directory staging file, then atomically replace."""
+    source = Path(source)
+    destination = Path(destination)
+    token = uuid.uuid4().hex
+    staging = destination.parent / f".{destination.name}.{token}.tmp"
+
+    try:
+        shutil.copy2(source, staging)
+        os.replace(staging, destination)
+    finally:
+        try:
+            staging.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def run_gamma_processing(
@@ -61,102 +85,136 @@ def run_gamma_processing(
     mapped_dem_par_out = output_dir / f"P.mapped.{run_id}.dem_par"
     sim_sar_tif_out = output_dir / f"P.{run_id}.sim_sar.radar.tif"
 
-    with TemporaryDirectory(prefix=f"gamma_{run_id}_") as tmp:
-        work = Path(tmp)
+    # data2tiff writes directly to a unique staging TIFF in the output
+    # directory. Keeping staging and final files on the same filesystem makes
+    # os.replace() atomic.
+    token = uuid.uuid4().hex
+    sim_sar_tif_stage = (
+        output_dir
+        / f".P.{run_id}.sim_sar.radar.{token}.tmp.tif"
+    )
 
-        print("\n[CHECK] Temporary GAMMA workspace")
-        print(f"        {work}")
+    try:
+        with TemporaryDirectory(prefix=f"gamma_{run_id}_") as tmp:
+            work = Path(tmp)
 
-        map_dem_par = work / "mapped.dem_par"
-        map_dem = work / "mapped.dem"
-        lookup = work / "lookup.lt"
-        ls_map = work / "ls_map"
-        ls_map_rdc = work / "ls_map_rdc"
-        incidence = work / "inc"
-        resolution = work / "res"
-        offnadir = work / "offnadir"
-        sim_sar = work / "sim_sar"
-        u = work / "u"
-        v = work / "v"
-        psi = work / "psi"
-        pix = work / "pix"
+            print("\n[CHECK] Temporary GAMMA workspace")
+            print(f"        {work}")
 
-        print("\n[STEP 1] Running gc_map2")
-        print(f"         DEM oversampling: lat={lat_ovr}, lon={lon_ovr}")
+            map_dem_par = work / "mapped.dem_par"
+            map_dem = work / "mapped.dem"
+            lookup = work / "lookup.lt"
+            ls_map = work / "ls_map"
+            ls_map_rdc = work / "ls_map_rdc"
+            incidence = work / "inc"
+            resolution = work / "res"
+            offnadir = work / "offnadir"
+            sim_sar = work / "sim_sar"
+            u = work / "u"
+            v = work / "v"
+            psi = work / "psi"
+            pix = work / "pix"
 
-        pg.gc_map2(
-            str(mli_par_path),
-            str(dem_par_path),
-            str(dem_path),
-            str(map_dem_par),
-            str(map_dem),
-            str(lookup),
-            lat_ovr,
-            lon_ovr,
-            str(ls_map),
-            str(ls_map_rdc),
-            str(incidence),
-            str(resolution),
-            str(offnadir),
-            str(sim_sar),
-            str(u),
-            str(v),
-            str(psi),
-            str(pix),
-        )
-        
-        if not map_dem_par.exists():
-            raise RuntimeError("gc_map2 did not create mapped DEM parameter file")
-        if not sim_sar.exists():
-            raise RuntimeError("gc_map2 did not create sim_sar")
+            print("\n[STEP 1] Running gc_map2")
+            print(f"         DEM oversampling: lat={lat_ovr}, lon={lon_ovr}")
 
-        shutil.copy2(map_dem_par, mapped_dem_par_out)
+            pg.gc_map2(
+                str(mli_par_path),
+                str(dem_par_path),
+                str(dem_path),
+                str(map_dem_par),
+                str(map_dem),
+                str(lookup),
+                lat_ovr,
+                lon_ovr,
+                str(ls_map),
+                str(ls_map_rdc),
+                str(incidence),
+                str(resolution),
+                str(offnadir),
+                str(sim_sar),
+                str(u),
+                str(v),
+                str(psi),
+                str(pix),
+            )
 
-        mapped_par = pg.ParFile(str(map_dem_par))
-        map_width = int(mapped_par.get_value("width"))
-        map_lines = int(mapped_par.get_value("nlines"))
+            if not map_dem_par.exists():
+                raise RuntimeError(
+                    "gc_map2 did not create mapped DEM parameter file"
+                )
+            if not sim_sar.exists():
+                raise RuntimeError("gc_map2 did not create sim_sar")
 
-        mli_par = pg.ParFile(str(mli_par_path))
-        range_samples = int(mli_par.get_value("range_samples"))
-        azimuth_lines = int(mli_par.get_value("azimuth_lines"))
+            mapped_par = pg.ParFile(str(map_dem_par))
+            map_width = int(mapped_par.get_value("width"))
+            map_lines = int(mapped_par.get_value("nlines"))
 
-        expected_sim_sar_bytes = map_width * map_lines * 4
-        if sim_sar.stat().st_size != expected_sim_sar_bytes:
-            raise RuntimeError("sim_sar size does not match mapped DEM dimensions")
+            mli_par = pg.ParFile(str(mli_par_path))
+            range_samples = int(mli_par.get_value("range_samples"))
+            azimuth_lines = int(mli_par.get_value("azimuth_lines"))
 
-        sim_sar_radar = work / "sim_sar.radar"
+            expected_sim_sar_bytes = map_width * map_lines * 4
+            actual_sim_sar_bytes = sim_sar.stat().st_size
+            if actual_sim_sar_bytes != expected_sim_sar_bytes:
+                raise RuntimeError(
+                    "sim_sar size does not match mapped DEM dimensions: "
+                    f"expected {expected_sim_sar_bytes} bytes, "
+                    f"got {actual_sim_sar_bytes} bytes"
+                )
 
-        print("\n[STEP 2] Converting sim_sar to radar geometry")
+            sim_sar_radar = work / "sim_sar.radar"
 
-        pg.geocode(
-            str(lookup),
-            str(sim_sar),
-            map_width,
-            str(sim_sar_radar),
-            range_samples,
-            azimuth_lines,
-            2,
-            0,
-        )
+            print("\n[STEP 2] Converting sim_sar to radar geometry")
 
-        if not sim_sar_radar.exists():
-            raise RuntimeError("geocode did not create sim_sar.radar")
+            pg.geocode(
+                str(lookup),
+                str(sim_sar),
+                map_width,
+                str(sim_sar_radar),
+                range_samples,
+                azimuth_lines,
+                2,
+                0,
+            )
 
-        expected_radar_bytes = range_samples * azimuth_lines * 4
-        if sim_sar_radar.stat().st_size != expected_radar_bytes:
-            raise RuntimeError("Radar-coordinate sim_sar size is unexpected")
+            if not sim_sar_radar.exists():
+                raise RuntimeError("geocode did not create sim_sar.radar")
 
-        print("\n[STEP 3] Writing radar-coordinate GeoTIFF")
+            expected_radar_bytes = range_samples * azimuth_lines * 4
+            actual_radar_bytes = sim_sar_radar.stat().st_size
+            if actual_radar_bytes != expected_radar_bytes:
+                raise RuntimeError(
+                    "Radar-coordinate sim_sar size is unexpected: "
+                    f"expected {expected_radar_bytes} bytes, "
+                    f"got {actual_radar_bytes} bytes"
+                )
 
-        pg.data2tiff(
-            str(sim_sar_radar),
-            range_samples,
-            2,
-            str(sim_sar_tif_out),
-        )
+            print("\n[STEP 3] Writing radar-coordinate GeoTIFF")
 
-        if not sim_sar_tif_out.exists():
-            raise RuntimeError("data2tiff did not create output GeoTIFF")
+            pg.data2tiff(
+                str(sim_sar_radar),
+                range_samples,
+                2,
+                str(sim_sar_tif_stage),
+            )
+
+            if not sim_sar_tif_stage.exists():
+                raise RuntimeError("data2tiff did not create output GeoTIFF")
+            if sim_sar_tif_stage.stat().st_size == 0:
+                raise RuntimeError("data2tiff created an empty output GeoTIFF")
+
+            # Commit both persistent outputs only after all GAMMA processing
+            # and validation has succeeded.
+            _atomic_copy(map_dem_par, mapped_dem_par_out)
+            os.replace(sim_sar_tif_stage, sim_sar_tif_out)
+
+    finally:
+        # Remove an incomplete staging TIFF after errors/interruption.
+        try:
+            sim_sar_tif_stage.unlink()
+        except FileNotFoundError:
+            pass
 
     print("\n[PASS] GAMMA processing completed")
     print(f"       {mapped_dem_par_out}")
