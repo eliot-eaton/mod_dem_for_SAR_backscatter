@@ -29,10 +29,47 @@ import argparse
 import os
 import shutil
 import uuid
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import py_gamma as pg
+
+
+def _required_par_int(par_file, key, path):
+    """Read a required integer key and give a useful corruption error."""
+    value = par_file.get_value(key)
+    if value is None:
+        raise RuntimeError(
+            f"Parameter file is incomplete or missing {key!r}: {path}"
+        )
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            f"Invalid {key!r} value {value!r} in parameter file: {path}"
+        )
+
+
+def _wait_for_stable_file(path, *, checks=3, delay_s=0.15):
+    """Require a file to exist and have a stable, non-zero size."""
+    path = Path(path)
+    previous = None
+    stable = 0
+    for _ in range(max(checks * 3, 3)):
+        if path.exists():
+            size = path.stat().st_size
+            if size > 0 and size == previous:
+                stable += 1
+                if stable >= checks:
+                    return size
+            else:
+                stable = 0
+            previous = size
+        time.sleep(delay_s)
+    if not path.exists():
+        raise RuntimeError(f"Expected GAMMA output was not created: {path}")
+    raise RuntimeError(f"GAMMA output did not reach a stable non-zero size: {path}")
 
 
 def _atomic_copy(source, destination):
@@ -139,20 +176,20 @@ def run_gamma_processing(
                 str(pix),
             )
 
-            if not map_dem_par.exists():
-                raise RuntimeError(
-                    "gc_map2 did not create mapped DEM parameter file"
-                )
-            if not sim_sar.exists():
-                raise RuntimeError("gc_map2 did not create sim_sar")
+            _wait_for_stable_file(map_dem_par)
+            _wait_for_stable_file(sim_sar)
 
             mapped_par = pg.ParFile(str(map_dem_par))
-            map_width = int(mapped_par.get_value("width"))
-            map_lines = int(mapped_par.get_value("nlines"))
+            map_width = _required_par_int(mapped_par, "width", map_dem_par)
+            map_lines = _required_par_int(mapped_par, "nlines", map_dem_par)
 
             mli_par = pg.ParFile(str(mli_par_path))
-            range_samples = int(mli_par.get_value("range_samples"))
-            azimuth_lines = int(mli_par.get_value("azimuth_lines"))
+            range_samples = _required_par_int(
+                mli_par, "range_samples", mli_par_path
+            )
+            azimuth_lines = _required_par_int(
+                mli_par, "azimuth_lines", mli_par_path
+            )
 
             expected_sim_sar_bytes = map_width * map_lines * 4
             actual_sim_sar_bytes = sim_sar.stat().st_size
@@ -178,8 +215,7 @@ def run_gamma_processing(
                 0,
             )
 
-            if not sim_sar_radar.exists():
-                raise RuntimeError("geocode did not create sim_sar.radar")
+            _wait_for_stable_file(sim_sar_radar)
 
             expected_radar_bytes = range_samples * azimuth_lines * 4
             actual_radar_bytes = sim_sar_radar.stat().st_size

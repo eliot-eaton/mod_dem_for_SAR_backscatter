@@ -1003,6 +1003,22 @@ def plot_top5_image_profile_summary(
     colors = {label: cycle[i] for i, label in enumerate(PLOT_PROFILE_LABELS)}
     x = np.arange(PROFILE_X1, PROFILE_X2 + 1)
 
+    # Build the observed dense MLI picked edge before the per-model loop.
+    # The SimSAR panel uses these coordinates before the middle MLI panel
+    # is drawn, so they must already exist here.
+    mli_edge_y = []
+    mli_edge_x = []
+    for row_y in INVERSION_ROWS:
+        pick = filtered_mli_picks_dense.get(row_y)
+        if pick is not None:
+            mli_edge_y.append(row_y)
+            mli_edge_x.append(pick.x_pixel)
+
+    if mli_edge_x:
+        order = np.argsort(mli_edge_y)
+        mli_edge_y = np.asarray(mli_edge_y)[order]
+        mli_edge_x = np.asarray(mli_edge_x)[order]
+
     for col, (_, model) in enumerate(models.iterrows()):
         run_id = str(model["run_id"])
         simsar_tif = Path(simsar_dir) / simsar_pattern.format(id=run_id)

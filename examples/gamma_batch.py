@@ -1,48 +1,45 @@
 #!/usr/bin/env python3
 """
-Standalone batch GAMMA runner with multiprocessing support.
+Robust batch GAMMA runner with concurrent multi-process execution.
 
-Runs in the fixed GAMMA/py_gamma environment and intentionally does not
-import the installed toposhapes_sar package.
+Each run ID is executed as a completely fresh Python subprocess running
+``gamma_processing.py``.  The parent uses a small ThreadPool only to supervise
+those independent subprocesses; the actual GAMMA work is performed by the
+separate processes.  This avoids persistent py_gamma state between IDs.
+
+Failed jobs can be retried automatically after the parallel pass.  By default
+one retry is performed serially, which is useful for transient failures caused
+by CPU/RAM/I/O pressure when several GAMMA programs run at once.
 
 Examples
 --------
-Serial (same behaviour as the original script):
+Five concurrent jobs, then retry any failures serially::
 
-    python gamma_batch.py \
-        ./mod_dem/synthetic_sweep \
-        ./sim_sar \
-        ./slcs/20201226M/20201226.mli.par \
-        0001-0100
+    python gamma_batch.py INPUT OUTPUT MLI_PAR 0009-0197 -j 5
 
-Four concurrent GAMMA jobs:
+More conservative concurrent run::
 
-    python gamma_batch.py \
-        ./mod_dem/synthetic_sweep \
-        ./sim_sar \
-        ./slcs/20201226M/20201226.mli.par \
-        0001-0100 \
-        -j 4
+    python gamma_batch.py INPUT OUTPUT MLI_PAR 0009-0197 -j 3
 
-Existing P.{ID}.sim_sar.radar.tif outputs are skipped unless --overwrite
-is supplied.
+Disable automatic retry::
 
-When -j/--workers is greater than 1, each run writes console output to:
+    python gamma_batch.py INPUT OUTPUT MLI_PAR 0009-0197 -j 5 --retries 0
 
-    OUTPUT_DIR/logs/gamma_{ID}.log
+Allow two OpenMP threads inside each GAMMA subprocess::
 
-This keeps parallel GAMMA output from becoming interleaved on the terminal.
+    python gamma_batch.py INPUT OUTPUT MLI_PAR 0009-0197 -j 3 --gamma-threads 2
+
+Existing final TIFFs are skipped unless ``--overwrite`` is supplied.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from contextlib import contextmanager
-from multiprocessing import get_context
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
@@ -52,20 +49,16 @@ def expand_run_ids(run_ids):
         run_ids = [run_ids]
 
     expanded = []
-
     for item in run_ids:
         item = str(item)
-
         if "-" in item:
             start_str, end_str = item.split("-", 1)
             start = int(start_str)
             end = int(end_str)
-
             if end < start:
                 raise ValueError(
                     f"Invalid run-ID range '{item}': end must be >= start."
                 )
-
             pad_width = max(len(start_str), len(end_str))
             expanded.extend(
                 f"{run_id:0{pad_width}d}"
@@ -73,7 +66,6 @@ def expand_run_ids(run_ids):
             )
         else:
             expanded.append(item)
-
     return expanded
 
 
@@ -81,53 +73,42 @@ def _deduplicate_preserving_order(items):
     seen = set()
     unique = []
     duplicates = []
-
     for item in items:
         if item in seen:
             duplicates.append(item)
-            continue
-        seen.add(item)
-        unique.append(item)
-
+        else:
+            seen.add(item)
+            unique.append(item)
     return unique, duplicates
 
 
-@contextmanager
-def _redirect_process_output(log_path):
-    """
-    Redirect this worker process's stdout/stderr file descriptors to a log.
-
-    File-descriptor redirection also catches output from GAMMA child
-    processes that inherit stdout/stderr.
-    """
-    log_path = Path(log_path)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    sys.stdout.flush()
-    sys.stderr.flush()
-
-    saved_stdout = os.dup(1)
-    saved_stderr = os.dup(2)
-
-    try:
-        with log_path.open("w", buffering=1) as log_file:
-            os.dup2(log_file.fileno(), 1)
-            os.dup2(log_file.fileno(), 2)
-            try:
-                yield
-            finally:
-                sys.stdout.flush()
-                sys.stderr.flush()
-    finally:
-        os.dup2(saved_stdout, 1)
-        os.dup2(saved_stderr, 2)
-        os.close(saved_stdout)
-        os.close(saved_stderr)
+def _build_processing_command(
+    processing_script,
+    input_dir,
+    output_dir,
+    mli_par,
+    run_id,
+    lat_ovr,
+    lon_ovr,
+):
+    return [
+        sys.executable,
+        str(processing_script),
+        str(input_dir),
+        str(run_id),
+        str(mli_par),
+        "--output-dir",
+        str(output_dir),
+        "--lat-ovr",
+        str(lat_ovr),
+        "--lon-ovr",
+        str(lon_ovr),
+    ]
 
 
-def _process_one_job(job):
-    """Top-level worker function so it can be pickled by multiprocessing."""
+def _run_subprocess_job(job):
     (
+        processing_script,
         input_dir,
         output_dir,
         mli_par,
@@ -135,47 +116,163 @@ def _process_one_job(job):
         lat_ovr,
         lon_ovr,
         log_path,
+        gamma_threads,
+        attempt,
     ) = job
 
     started = time.perf_counter()
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
-        # Import inside the worker. This avoids importing py_gamma in the
-        # parent process before workers are created.
-        from gamma_processing import run_gamma_processing
+    command = _build_processing_command(
+        processing_script,
+        input_dir,
+        output_dir,
+        mli_par,
+        run_id,
+        lat_ovr,
+        lon_ovr,
+    )
 
-        kwargs = dict(
-            input_dir=input_dir,
-            run_id=run_id,
-            mli_par_path=mli_par,
-            output_dir=output_dir,
-            lat_ovr=lat_ovr,
-            lon_ovr=lon_ovr,
+    env = os.environ.copy()
+    if gamma_threads is not None:
+        # GAMMA releases contain internally parallelised programs.  When
+        # several independent jobs are run at once, limiting OpenMP-style
+        # thread pools helps avoid CPU/RAM oversubscription.  Variables that
+        # are irrelevant to a particular GAMMA build are simply ignored.
+        thread_value = str(gamma_threads)
+        env["OMP_NUM_THREADS"] = thread_value
+        env["OPENBLAS_NUM_THREADS"] = thread_value
+        env["MKL_NUM_THREADS"] = thread_value
+        env["NUMEXPR_NUM_THREADS"] = thread_value
+
+    with log_path.open("w") as log_file:
+        log_file.write(
+            f"[BATCH] run_id={run_id} attempt={attempt} "
+            f"gamma_threads={gamma_threads}\n"
+        )
+        log_file.write("[BATCH] command: " + " ".join(command) + "\n\n")
+        log_file.flush()
+
+        completed = subprocess.run(
+            command,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
+            check=False,
         )
 
-        if log_path is None:
-            run_gamma_processing(**kwargs)
-        else:
-            with _redirect_process_output(log_path):
-                print(f"[WORKER] Starting GAMMA run {run_id}")
-                run_gamma_processing(**kwargs)
+    elapsed_s = time.perf_counter() - started
 
+    if completed.returncode == 0:
         return {
             "run_id": run_id,
             "status": "successful",
             "error": None,
-            "elapsed_s": time.perf_counter() - started,
-            "log_path": log_path,
+            "elapsed_s": elapsed_s,
+            "log_path": str(log_path),
+            "attempt": attempt,
         }
 
-    except Exception as exc:
-        return {
-            "run_id": run_id,
-            "status": "failed",
-            "error": f"{type(exc).__name__}: {exc}",
-            "elapsed_s": time.perf_counter() - started,
-            "log_path": log_path,
+    return {
+        "run_id": run_id,
+        "status": "failed",
+        "error": f"gamma_processing.py exited with code {completed.returncode}",
+        "elapsed_s": elapsed_s,
+        "log_path": str(log_path),
+        "attempt": attempt,
+    }
+
+
+def _run_pass(
+    run_ids,
+    *,
+    workers,
+    attempt,
+    processing_script,
+    input_dir,
+    output_dir,
+    mli_par,
+    lat_ovr,
+    lon_ovr,
+    gamma_threads,
+    logs_dir,
+):
+    """Run one pass and return (passed_ids, failed_results)."""
+    passed = []
+    failed_results = []
+
+    jobs = []
+    for run_id in run_ids:
+        suffix = "" if attempt == 1 else f".retry{attempt - 1}"
+        log_path = logs_dir / f"gamma_{run_id}{suffix}.log"
+        jobs.append(
+            (
+                str(processing_script),
+                str(input_dir),
+                str(output_dir),
+                str(mli_par),
+                run_id,
+                lat_ovr,
+                lon_ovr,
+                str(log_path),
+                gamma_threads,
+                attempt,
+            )
+        )
+
+    effective_workers = min(workers, len(jobs))
+    pass_label = "parallel pass" if attempt == 1 else f"retry {attempt - 1}"
+
+    print(
+        f"\n[RUN] {pass_label}: {len(jobs)} job(s), "
+        f"{effective_workers} worker(s)"
+    )
+
+    if not jobs:
+        return passed, failed_results
+
+    # Threads only supervise subprocess.run(); GAMMA itself executes in the
+    # independent Python/GAMMA subprocesses created above.
+    with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+        future_to_id = {
+            executor.submit(_run_subprocess_job, job): job[4]
+            for job in jobs
         }
+
+        completed_count = 0
+        for future in as_completed(future_to_id):
+            completed_count += 1
+            run_id = future_to_id[future]
+
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "run_id": run_id,
+                    "status": "failed",
+                    "error": f"batch supervisor error: {type(exc).__name__}: {exc}",
+                    "elapsed_s": 0.0,
+                    "log_path": None,
+                    "attempt": attempt,
+                }
+
+            if result["status"] == "successful":
+                passed.append(run_id)
+                print(
+                    f"[PASS {completed_count:>4}/{len(jobs)}] "
+                    f"{run_id}  {result['elapsed_s'] / 60.0:.2f} min"
+                )
+            else:
+                failed_results.append(result)
+                print(
+                    f"[FAIL {completed_count:>4}/{len(jobs)}] "
+                    f"{run_id}: {result['error']}"
+                )
+                if result.get("log_path"):
+                    print(f"       log: {result['log_path']}")
+
+    return passed, failed_results
 
 
 def run_gamma_batch(
@@ -188,29 +285,46 @@ def run_gamma_batch(
     lat_ovr=1,
     lon_ovr=1,
     workers=1,
+    retries=1,
+    retry_workers=1,
+    gamma_threads=1,
 ):
     input_dir = Path(input_dir).resolve()
     output_dir = Path(output_dir).resolve()
     mli_par = Path(mli_par).resolve()
+    processing_script = Path(__file__).resolve().with_name("gamma_processing.py")
 
     if workers < 1:
         raise ValueError("workers must be >= 1")
+    if retries < 0:
+        raise ValueError("retries must be >= 0")
+    if retry_workers < 1:
+        raise ValueError("retry_workers must be >= 1")
+    if gamma_threads is not None and gamma_threads < 1:
+        raise ValueError("gamma_threads must be >= 1")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     dem_par = input_dir / "P.dem_par"
     if not dem_par.exists():
         raise FileNotFoundError(dem_par)
-
     if not mli_par.exists():
         raise FileNotFoundError(mli_par)
+    if not processing_script.exists():
+        raise FileNotFoundError(processing_script)
+
+    if mli_par.suffix.lower() in {".tif", ".tiff"}:
+        raise ValueError(
+            f"Expected a GAMMA MLI parameter file, not a GeoTIFF: {mli_par}"
+        )
 
     run_ids = expand_run_ids(run_ids)
     run_ids, duplicates = _deduplicate_preserving_order(run_ids)
 
     successful = []
     skipped = []
-    failed = []
+    permanently_failed = []
+    recovered = []
     pending = []
 
     print("\n[SETUP] GAMMA batch")
@@ -218,20 +332,24 @@ def run_gamma_batch(
     print(f"        output directory:    {output_dir}")
     print(f"        MLI parameter file:  {mli_par}")
     print(f"        workers:             {workers}")
+    print(f"        retries:             {retries}")
+    print(f"        retry workers:       {retry_workers}")
+    print(f"        GAMMA threads/job:   {gamma_threads}")
     print(f"        IDs:                 {' '.join(run_ids)}")
 
     if duplicates:
-        duplicate_text = " ".join(dict.fromkeys(duplicates))
-        print(f"[WARN] Duplicate IDs ignored: {duplicate_text}")
+        print(
+            "[WARN] Duplicate IDs ignored: "
+            + " ".join(dict.fromkeys(duplicates))
+        )
 
-    # Validate/skip in the parent process before any worker is launched.
     for run_id in run_ids:
         dem_path = input_dir / f"P.{run_id}.dem"
         output_tif = output_dir / f"P.{run_id}.sim_sar.radar.tif"
 
         if not dem_path.exists():
             print(f"[FAIL] {run_id}: missing DEM: {dem_path}")
-            failed.append(run_id)
+            permanently_failed.append(run_id)
             continue
 
         if output_tif.exists() and not overwrite:
@@ -243,138 +361,116 @@ def run_gamma_batch(
         pending.append(run_id)
 
     if not pending:
-        print("\n[INFO] No GAMMA jobs need to run.")
-        return _print_summary(successful, skipped, failed, 0.0, 0)
+        return _print_summary(
+            successful,
+            skipped,
+            permanently_failed,
+            recovered,
+            0.0,
+            0,
+        )
+
+    logs_dir = output_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    print(f"        worker logs:         {logs_dir}")
 
     started = time.perf_counter()
+    jobs_run = 0
 
-    # Keep serial mode easy to debug and behaviour close to the original.
-    if workers == 1:
-        for index, run_id in enumerate(pending, start=1):
-            print("\n" + "=" * 72)
-            print(f"[GAMMA {run_id}] {index}/{len(pending)}")
-            print("=" * 72)
+    passed, failures = _run_pass(
+        pending,
+        workers=workers,
+        attempt=1,
+        processing_script=processing_script,
+        input_dir=input_dir,
+        output_dir=output_dir,
+        mli_par=mli_par,
+        lat_ovr=lat_ovr,
+        lon_ovr=lon_ovr,
+        gamma_threads=gamma_threads,
+        logs_dir=logs_dir,
+    )
+    jobs_run += len(pending)
+    successful.extend(passed)
 
-            result = _process_one_job(
-                (
-                    str(input_dir),
-                    str(output_dir),
-                    str(mli_par),
-                    run_id,
-                    lat_ovr,
-                    lon_ovr,
-                    None,
-                )
-            )
+    failed_ids = [result["run_id"] for result in failures]
 
-            if result["status"] == "successful":
-                successful.append(run_id)
-                print(
-                    f"[PASS] {run_id} "
-                    f"({result['elapsed_s'] / 60.0:.2f} min)"
-                )
-            else:
-                failed.append(run_id)
-                print(f"[FAIL] {run_id}: {result['error']}")
+    for retry_index in range(1, retries + 1):
+        if not failed_ids:
+            break
 
-    else:
-        logs_dir = output_dir / "logs"
-        logs_dir.mkdir(parents=True, exist_ok=True)
-
-        effective_workers = min(workers, len(pending))
         print(
-            f"\n[RUN] Processing {len(pending)} job(s) with "
-            f"{effective_workers} worker(s)"
+            f"\n[RETRY] {len(failed_ids)} failed ID(s) will be retried "
+            f"with {retry_workers} worker(s): {' '.join(failed_ids)}"
         )
-        print(f"      worker logs: {logs_dir}")
-        print("      multiprocessing start method: spawn")
 
-        jobs = []
-        for run_id in pending:
-            jobs.append(
-                (
-                    str(input_dir),
-                    str(output_dir),
-                    str(mli_par),
-                    run_id,
-                    lat_ovr,
-                    lon_ovr,
-                    str(logs_dir / f"gamma_{run_id}.log"),
-                )
-            )
+        retry_passed, retry_failures = _run_pass(
+            failed_ids,
+            workers=retry_workers,
+            attempt=retry_index + 1,
+            processing_script=processing_script,
+            input_dir=input_dir,
+            output_dir=output_dir,
+            mli_par=mli_par,
+            lat_ovr=lat_ovr,
+            lon_ovr=lon_ovr,
+            gamma_threads=gamma_threads,
+            logs_dir=logs_dir,
+        )
+        jobs_run += len(failed_ids)
 
-        # 'spawn' gives every GAMMA worker a clean Python/py_gamma process,
-        # avoiding forked library state inherited from the parent.
-        mp_context = get_context("spawn")
+        successful.extend(retry_passed)
+        recovered.extend(retry_passed)
+        failed_ids = [result["run_id"] for result in retry_failures]
 
-        with ProcessPoolExecutor(
-            max_workers=effective_workers,
-            mp_context=mp_context,
-        ) as executor:
-            future_to_id = {
-                executor.submit(_process_one_job, job): job[3]
-                for job in jobs
-            }
-
-            completed = 0
-            for future in as_completed(future_to_id):
-                completed += 1
-                run_id = future_to_id[future]
-
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    result = {
-                        "run_id": run_id,
-                        "status": "failed",
-                        "error": f"Worker process error: {type(exc).__name__}: {exc}",
-                        "elapsed_s": 0.0,
-                        "log_path": str(logs_dir / f"gamma_{run_id}.log"),
-                    }
-
-                if result["status"] == "successful":
-                    successful.append(run_id)
-                    print(
-                        f"[PASS {completed:>4}/{len(pending)}] "
-                        f"{run_id}  {result['elapsed_s'] / 60.0:.2f} min"
-                    )
-                else:
-                    failed.append(run_id)
-                    print(
-                        f"[FAIL {completed:>4}/{len(pending)}] "
-                        f"{run_id}: {result['error']}"
-                    )
-                    if result.get("log_path"):
-                        print(f"       log: {result['log_path']}")
-
+    permanently_failed.extend(failed_ids)
     elapsed_s = time.perf_counter() - started
+
     return _print_summary(
         successful,
         skipped,
-        failed,
+        permanently_failed,
+        recovered,
         elapsed_s,
-        len(pending),
+        jobs_run,
     )
 
 
-def _print_summary(successful, skipped, failed, elapsed_s, jobs_run):
+def _print_summary(
+    successful,
+    skipped,
+    failed,
+    recovered,
+    elapsed_s,
+    jobs_run,
+):
+    # Keep deterministic output order without double-counting.
+    successful = list(dict.fromkeys(successful))
+    skipped = list(dict.fromkeys(skipped))
+    failed = list(dict.fromkeys(failed))
+    recovered = list(dict.fromkeys(recovered))
+
     print("\n" + "=" * 72)
     print("[DONE] GAMMA batch summary")
     print("=" * 72)
     print(f"        successful: {len(successful)}")
     print(f"        skipped:    {len(skipped)}")
+    print(f"        recovered:  {len(recovered)}")
     print(f"        failed:     {len(failed)}")
-
-    if jobs_run and elapsed_s > 0:
-        print(f"        wall time:  {elapsed_s / 60.0:.2f} min")
-        print(f"        throughput: {jobs_run / (elapsed_s / 60.0):.2f} jobs/min")
-
+    if elapsed_s > 0:
+        print(f"        elapsed:    {elapsed_s / 60.0:.2f} min")
+        if jobs_run:
+            print(f"        attempts:   {jobs_run}")
+            print(f"        rate:       {jobs_run / (elapsed_s / 60.0):.2f} attempts/min")
+    if recovered:
+        print("        retry PASS: " + " ".join(recovered))
     if failed:
         print("        failed IDs: " + " ".join(failed))
 
     return {
         "successful": successful,
         "skipped": skipped,
+        "recovered": recovered,
         "failed": failed,
     }
 
@@ -382,8 +478,8 @@ def _print_summary(successful, skipped, failed, elapsed_s, jobs_run):
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Generate sim_sar GeoTIFFs for a list of P.{ID}.dem files, "
-            "optionally using multiple concurrent GAMMA worker processes."
+            "Generate sim_sar GeoTIFFs concurrently for P.{ID}.dem files, "
+            "with optional serial retry of transient failures."
         )
     )
     parser.add_argument("input_dir")
@@ -398,15 +494,33 @@ def main():
         "--workers",
         type=int,
         default=1,
+        help="Concurrent GAMMA subprocesses in the first pass (default: 1).",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=1,
+        help="Retry count for failed IDs after the first pass (default: 1).",
+    )
+    parser.add_argument(
+        "--retry-workers",
+        type=int,
+        default=1,
+        help="Concurrent workers during retries (default: 1).",
+    )
+    parser.add_argument(
+        "--gamma-threads",
+        type=int,
+        default=1,
         help=(
-            "Number of independent GAMMA jobs to run concurrently "
-            "(default: 1). Start with 2-4 and benchmark throughput."
+            "OpenMP/BLAS thread limit inherited by each GAMMA job "
+            "(default: 1)."
         ),
     )
 
     args = parser.parse_args()
 
-    run_gamma_batch(
+    result = run_gamma_batch(
         input_dir=args.input_dir,
         output_dir=args.output_dir,
         mli_par=args.mli_par,
@@ -415,7 +529,14 @@ def main():
         lat_ovr=args.lat_ovr,
         lon_ovr=args.lon_ovr,
         workers=args.workers,
+        retries=args.retries,
+        retry_workers=args.retry_workers,
+        gamma_threads=args.gamma_threads,
     )
+
+    # Useful for shell pipelines / schedulers.
+    if result["failed"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
