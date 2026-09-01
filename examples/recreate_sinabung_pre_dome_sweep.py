@@ -67,7 +67,7 @@ def get_next_run_id(output_dir: Path) -> int:
 # USER SETTINGS
 # =============================================================================
 
-DATA = Path("mod_dem")
+DATA = Path("mod_dem_crater")
 
 DEM = DATA / "P.dem"
 PAR = DATA / "P.dem_par"
@@ -98,6 +98,12 @@ Z_VALUES = [
 SEMI_AXES_VALUES = [
     (100, 150, 80),
     (100, 150, 100),
+    (100, 150, 120),
+    (100, 150, 150),
+    (100, 120, 80),
+    (100, 120, 100),
+    (100, 120, 120),
+    (100, 120, 150),
 ]
 
 # yaw, pitch, roll in degrees
