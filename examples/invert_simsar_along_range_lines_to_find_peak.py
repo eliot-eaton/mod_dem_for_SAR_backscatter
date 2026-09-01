@@ -1049,6 +1049,14 @@ def plot_top5_image_profile_summary(
                 color="orange",
                 zorder=7,
             )
+            ax.plot(
+                mli_edge_x, mli_edge_y,
+                linewidth=2.2,
+                marker=".", markersize=2.5,
+                label="Filtered MLI picked edge",
+                color="blue",
+                zorder=7,
+            )
 
         for label, row_y in zip(PLOT_PROFILE_LABELS, PLOT_PROFILE_ROWS):
             color = colors[label]
