@@ -1046,6 +1046,7 @@ def plot_top5_image_profile_summary(
                 linewidth=2.2,
                 marker=".", markersize=2.5,
                 label="SimSAR picked edge",
+                color="orange",
                 zorder=7,
             )
 
@@ -1093,8 +1094,17 @@ def plot_top5_image_profile_summary(
                 linewidth=2.2,
                 marker=".", markersize=2.5,
                 label="Filtered MLI picked edge",
+                color="blue",
                 zorder=7,
             )
+            ax.plot(
+                    sim_edge_x, sim_edge_y,
+                    linewidth=2.2,
+                    marker=".", markersize=2.5,
+                    label="SimSAR picked edge",
+                    color="orange",
+                    zorder=7,
+                )
 
         for label, row_y in zip(PLOT_PROFILE_LABELS, PLOT_PROFILE_ROWS):
             color = colors[label]
