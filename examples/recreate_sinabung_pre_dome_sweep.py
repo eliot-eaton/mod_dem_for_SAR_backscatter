@@ -87,7 +87,7 @@ X_VALUES = [
     432500.0,
     432520.0,
     432540.0,
-    432560.0,
+
 
 ]
 
@@ -107,7 +107,6 @@ Y_VALUES = [
 ]
 
 Z_VALUES = [
-    2360,
     2340,
     2320,
     2300,
@@ -115,10 +114,11 @@ Z_VALUES = [
   
 ]
 # Semi-axes (a, b, c), metres
+SEMI_AXES_VALUES = []
 
-for a in np.arange(60, 160, 10):
-    for b in np.arange(100, 160, 10):
-        for c in np.arange(60, 160, 10):
+for a in np.arange(60, 160, 20):
+    for b in np.arange(100, 160, 20):
+        for c in np.arange(60, 160, 20):
             SEMI_AXES_VALUES.append((a, b, c))
 
 

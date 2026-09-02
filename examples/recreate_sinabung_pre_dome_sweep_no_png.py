@@ -53,34 +53,45 @@ OUT.mkdir(parents=True, exist_ok=True)
 # Geometry sweep
 # -----------------------------------------------------------------------------
 
+
 X_VALUES = [
+    432480.0,
     432500.0,
-    432510.0,
     432520.0,
+    432540.0,
+
+
 ]
 
 Y_VALUES = [
-    350450.0,
     350440.0,
+
     350420.0,
-    350420.0,
+
+    350400.0,
+
+    350380,
+
+    350360,
+
+
+    
 ]
 
 Z_VALUES = [
-    2355,
-    2335,
-    2315,
+    2340,
+    2320,
+    2300,
+    2280,
+  
 ]
-
 # Semi-axes (a, b, c), metres
-SEMI_AXES_VALUES = [
-    (100, 150, 100),
-    (100, 150, 120),
-    (100, 120, 150),
-    (100, 130, 150),
-    (100, 140, 150),
-    (100, 170, 150),
-]
+SEMI_AXES_VALUES = []
+
+for a in np.arange(60, 160, 20):
+    for b in np.arange(100, 160, 20):
+        for c in np.arange(60, 160, 20):
+            SEMI_AXES_VALUES.append((a, b, c))
 
 # yaw, pitch, roll in degrees
 ROTATION_VALUES = [
