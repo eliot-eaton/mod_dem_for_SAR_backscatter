@@ -40,7 +40,7 @@ def get_next_run_id(output_dir: Path) -> int:
 # USER SETTINGS
 # =============================================================================
 
-DATA = Path("mod_dem_crater")
+DATA = Path("mod_dem_crater_sweep")
 
 DEM = DATA / "P.dem"
 PAR = DATA / "P.dem_par"
@@ -79,6 +79,7 @@ Y_VALUES = [
 ]
 
 Z_VALUES = [
+    2360,
     2340,
     2320,
     2300,
@@ -179,7 +180,7 @@ print(f"        total realizations = {len(parameter_sets)}")
 # =============================================================================
 
 start_id = get_next_run_id(OUT)
-print(f"        first new run ID = {start_id:04d}")
+print(f"        first new run ID = {start_id:06d}")
 
 for i, (
     shape_x,
@@ -189,7 +190,7 @@ for i, (
     rotation_deg,
 ) in enumerate(parameter_sets):
     numeric_id = start_id + i
-    run_id = f"{numeric_id:04d}"
+    run_id = f"{numeric_id:06d}"
 
     print("\n" + "=" * 72)
     print(f"[RUN {run_id}] {i + 1}/{len(parameter_sets)}")
