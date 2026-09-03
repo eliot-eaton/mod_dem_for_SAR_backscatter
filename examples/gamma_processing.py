@@ -141,16 +141,16 @@ def run_gamma_processing(
             map_dem_par = work / "mapped.dem_par"
             map_dem = work / "mapped.dem"
             lookup = work / "lookup.lt"
-            ls_map = work / "ls_map"
-            ls_map_rdc = work / "ls_map_rdc"
-            incidence = work / "inc"
-            resolution = work / "res"
-            offnadir = work / "offnadir"
+            ls_map = '-'
+            ls_map_rdc = '-'
+            incidence = '-'
+            resolution = '-'
+            offnadir = '-'
             sim_sar = work / "sim_sar"
-            u = work / "u"
-            v = work / "v"
-            psi = work / "psi"
-            pix = work / "pix"
+            u = '-'
+            v ='-'
+            psi = '-'
+            pix = '-'
 
             print("\n[STEP 1] Running gc_map2")
             print(f"         DEM oversampling: lat={lat_ovr}, lon={lon_ovr}")
