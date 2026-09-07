@@ -20,7 +20,7 @@ MLI. Raw MLI peaks are retained as diagnostics but never affect ranking.
 Interaction-aware SimSAR no-data handling
 ------------------------------------------
 No-data/NaN pixels are shown as -40 dB in plots. The special
-"data -> no-data -> data: search only the final data segment" rule is applied
+"data -> no-data -> data: search the first data segment after the first internal no-data gap" rule is applied
 ONLY to excavation/lowering geometries:
 
     excavate_to_lower
@@ -109,7 +109,7 @@ DEFAULT_IMAGE_Y1 = 1960
 DEFAULT_IMAGE_Y2 = 2060
 IMAGE_Y1 = DEFAULT_IMAGE_Y1
 IMAGE_Y2 = DEFAULT_IMAGE_Y2
-IMAGE_AZIMUTH_PAD = 60
+IMAGE_AZIMUTH_PAD = 150
 
 DISPLAY_VMIN_DB = -30.0
 DISPLAY_VMAX_DB = 0.0
@@ -526,7 +526,16 @@ def find_post_shadow_peak(
         if not runs:
             return None
 
-        start, stop = runs[-1]
+        # For excavation profiles, an internal no-data interval represents a
+        # shadow section. If there are multiple shadow/data sections, search
+        # the FIRST finite section immediately after the first internal shadow
+        # gap rather than jumping to the final finite section of the profile.
+        #
+        # finite run 0  -> data before the first internal shadow
+        # finite run 1  -> data immediately after the first internal shadow
+        # finite run 2+ -> later returns after subsequent shadow sections
+        run_index = 1 if len(runs) >= 2 else 0
+        start, stop = runs[run_index]
         if (stop - start) < max(3, int(min_segment_pixels)):
             return None
 
