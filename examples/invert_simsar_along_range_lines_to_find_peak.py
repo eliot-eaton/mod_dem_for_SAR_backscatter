@@ -502,6 +502,7 @@ def find_post_shadow_peak(
     peak_mode: str = "first",
     respect_internal_nodata_gaps: bool = False,
     min_segment_pixels: int = 5,
+    allow_boundary_peak: bool = False,
 ) -> Optional[PeakPick]:
     if peak_mode not in {"first", "most_prominent"}:
         raise ValueError(
@@ -559,13 +560,48 @@ def find_post_shadow_peak(
         distance=max(1, int(min_distance_pixels)),
     )
 
-    if peaks.size == 0:
-        return None
+    # scipy.signal.find_peaks() never considers the first sample of an
+    # array to be a peak because it has no left-hand neighbour. For SimSAR
+    # profiles this matters when the physically relevant bright return
+    # occurs immediately at the first valid pixel after a shadow/no-data
+    # section. In that case, allow the segment boundary itself to be a
+    # candidate if the smoothed signal falls away immediately to the right.
+    #
+    # This option is enabled for SimSAR only; MLI picking is unchanged.
+    boundary_pick: Optional[PeakPick] = None
+    if allow_boundary_peak and y_smooth.size >= 2 and y_smooth[0] > y_smooth[1]:
+        # Estimate a right-sided prominence only for diagnostics/ranking.
+        # The boundary candidate is not rejected by the normal prominence
+        # threshold because a conventional two-sided prominence is undefined
+        # at the edge of the valid segment.
+        window = min(
+            y_smooth.size,
+            max(3, 1 + 2 * max(1, int(min_distance_pixels))),
+        )
+        right_min = float(np.min(y_smooth[1:window]))
+        boundary_prominence = max(0.0, float(y_smooth[0]) - right_min)
+        boundary_pick = PeakPick(
+            x_pixel=float(x[0]),
+            intensity_db=float(y_smooth[0]),
+            prominence_db=boundary_prominence,
+        )
 
     if peak_mode == "first":
+        if boundary_pick is not None:
+            return boundary_pick
+        if peaks.size == 0:
+            return None
         chosen = 0
     else:
+        if peaks.size == 0:
+            return boundary_pick
         chosen = int(np.argmax(properties["prominences"]))
+        if (
+            boundary_pick is not None
+            and boundary_pick.prominence_db
+            > float(properties["prominences"][chosen])
+        ):
+            return boundary_pick
 
     idx = int(peaks[chosen])
     return PeakPick(
@@ -583,6 +619,7 @@ def pick_dense_profile_set(
     min_distance_pixels: int,
     peak_mode: str,
     respect_internal_nodata_gaps: bool = False,
+    allow_boundary_peak: bool = False,
 ) -> Dict[int, Optional[PeakPick]]:
     picks: Dict[int, Optional[PeakPick]] = {}
 
@@ -595,6 +632,7 @@ def pick_dense_profile_set(
             min_distance_pixels=min_distance_pixels,
             peak_mode=peak_mode,
             respect_internal_nodata_gaps=respect_internal_nodata_gaps,
+            allow_boundary_peak=allow_boundary_peak,
         )
 
     return picks
@@ -2181,6 +2219,7 @@ def run_peak_inversion(
                 respect_internal_nodata_gaps=(
                     use_excavation_gap_rule
                 ),
+                allow_boundary_peak=True,
             )
 
             summary, residuals = score_dense_model(
