@@ -1,0 +1,2836 @@
+#!/usr/bin/env python3
+"""
+Invert SimSAR models against an observed MLI using post-shadow peak positions.
+
+The observed MLI is median filtered before its peaks are picked. SimSAR is
+median filtered separately (3 x 3 by default), then all plausible post-shadow
+peaks are found on each azimuth row. A continuity tracker chooses one SimSAR
+edge across the full azimuth corridor instead of picking every row in
+isolation. Large row-to-row jumps are rejected and rows can be left unpicked
+when there is no sensible continuation.
+
+For excavation models, the search uses the first finite data section after the
+first internal shadow gap. A bright return at the first valid pixel after that
+shadow is allowed as a peak candidate.
+
+Ranking uses only the filtered MLI peak positions. Raw MLI values are retained
+for CSV diagnostics but are never plotted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.windows import Window
+from scipy.ndimage import gaussian_filter1d, median_filter
+from scipy.signal import find_peaks
+
+
+# =============================================================================
+# GEOMETRY
+# =============================================================================
+
+PROFILE_X1 = 775
+PROFILE_X2 = 900
+
+PLOT_PROFILE_LABELS = ("A", "B", "C")
+PLOT_PROFILE_ROWS = (2030, 2010, 1990)
+PLOT_SHADOW_START_XS = (812, 823, 826)
+
+DEFAULT_INVERSION_ROW_MIN = min(PLOT_PROFILE_ROWS)
+DEFAULT_INVERSION_ROW_MAX = max(PLOT_PROFILE_ROWS)
+
+INVERSION_ROW_MIN = DEFAULT_INVERSION_ROW_MIN
+INVERSION_ROW_MAX = DEFAULT_INVERSION_ROW_MAX
+INVERSION_ROWS = tuple(range(INVERSION_ROW_MIN, INVERSION_ROW_MAX + 1))
+
+RANGE_PIXEL_SPACING_M = 2.728212
+
+IMAGE_X1 = 750
+IMAGE_X2 = 930
+DEFAULT_IMAGE_Y1 = 1960
+DEFAULT_IMAGE_Y2 = 2060
+IMAGE_Y1 = DEFAULT_IMAGE_Y1
+IMAGE_Y2 = DEFAULT_IMAGE_Y2
+IMAGE_AZIMUTH_PAD = 150
+
+DISPLAY_VMIN_DB = -30.0
+DISPLAY_VMAX_DB = 0.0
+SIMSAR_NODATA_DB = -40.0
+
+
+@dataclass(frozen=True)
+class PeakPick:
+    x_pixel: float
+    intensity_db: float
+    prominence_db: float
+
+
+def plot_label_for_row(row: int) -> str:
+    mapping = dict(zip(PLOT_PROFILE_ROWS, PLOT_PROFILE_LABELS))
+    return mapping.get(int(row), str(int(row)))
+
+
+def _interp_extrapolate_piecewise(
+    rows: np.ndarray,
+    anchor_rows: np.ndarray,
+    anchor_starts: np.ndarray,
+) -> np.ndarray:
+    order = np.argsort(anchor_rows)
+    xp = np.asarray(anchor_rows, dtype=float)[order]
+    fp = np.asarray(anchor_starts, dtype=float)[order]
+    x = np.asarray(rows, dtype=float)
+
+    if xp.size < 2:
+        raise ValueError("At least two shadow-start anchors are required.")
+
+    out = np.interp(x, xp, fp)
+
+    left = x < xp[0]
+    if np.any(left):
+        slope_left = (fp[1] - fp[0]) / (xp[1] - xp[0])
+        out[left] = fp[0] + slope_left * (x[left] - xp[0])
+
+    right = x > xp[-1]
+    if np.any(right):
+        slope_right = (fp[-1] - fp[-2]) / (xp[-1] - xp[-2])
+        out[right] = fp[-1] + slope_right * (x[right] - xp[-1])
+
+    return out
+
+
+def dense_shadow_start_map() -> Dict[int, float]:
+    anchor_rows = np.asarray(PLOT_PROFILE_ROWS, dtype=float)
+    anchor_starts = np.asarray(PLOT_SHADOW_START_XS, dtype=float)
+    rows = np.asarray(INVERSION_ROWS, dtype=float)
+    starts = _interp_extrapolate_piecewise(rows, anchor_rows, anchor_starts)
+    return {int(row): float(start) for row, start in zip(rows, starts)}
+
+
+def _configure_inversion_geometry(azimuth_min: int, azimuth_max: int) -> None:
+    global INVERSION_ROW_MIN, INVERSION_ROW_MAX, INVERSION_ROWS
+    global SHADOW_START_BY_ROW, IMAGE_Y1, IMAGE_Y2
+
+    azimuth_min = int(azimuth_min)
+    azimuth_max = int(azimuth_max)
+
+    if azimuth_min < 0:
+        raise ValueError("azimuth_min must be >= 0.")
+    if azimuth_max < azimuth_min:
+        raise ValueError("azimuth_max must be >= azimuth_min.")
+
+    INVERSION_ROW_MIN = azimuth_min
+    INVERSION_ROW_MAX = azimuth_max
+    INVERSION_ROWS = tuple(range(INVERSION_ROW_MIN, INVERSION_ROW_MAX + 1))
+    SHADOW_START_BY_ROW = dense_shadow_start_map()
+
+    IMAGE_Y1 = min(DEFAULT_IMAGE_Y1, INVERSION_ROW_MIN - IMAGE_AZIMUTH_PAD)
+    IMAGE_Y1 = max(0, IMAGE_Y1)
+    IMAGE_Y2 = max(DEFAULT_IMAGE_Y2, INVERSION_ROW_MAX + IMAGE_AZIMUTH_PAD)
+
+
+SHADOW_START_BY_ROW = dense_shadow_start_map()
+
+
+# =============================================================================
+# MODEL INTERACTION / PROVENANCE
+# =============================================================================
+
+EXCAVATION_INTERACTIONS = {"excavate_to_lower", "subtract_thickness"}
+FILL_INTERACTIONS = {"fill_to_upper", "add_thickness"}
+KNOWN_INTERACTIONS = EXCAVATION_INTERACTIONS | FILL_INTERACTIONS
+
+
+def _read_interactions_from_run_json(path: Path) -> List[str]:
+    payload = json.loads(Path(path).read_text())
+    interactions: List[str] = []
+
+    for shape in payload.get("shapes", []):
+        value = shape.get("interaction")
+        if value is not None:
+            value = str(value)
+            if value not in interactions:
+                interactions.append(value)
+
+    return interactions
+
+
+def resolve_model_interaction(
+    run_id: str,
+    *,
+    simsar_dir: Path,
+    interaction: str = "auto",
+    provenance_dir: Optional[Path] = None,
+    provenance_pattern: str = "{id}.json",
+) -> Tuple[str, bool, Optional[Path]]:
+    if interaction != "auto":
+        if interaction not in KNOWN_INTERACTIONS:
+            raise ValueError(f"Unknown interaction override: {interaction}")
+        return interaction, interaction in EXCAVATION_INTERACTIONS, None
+
+    candidates: List[Path] = []
+    if provenance_dir is not None:
+        candidates.append(
+            Path(provenance_dir) / provenance_pattern.format(id=run_id)
+        )
+    else:
+        candidates.extend([
+            Path(simsar_dir) / provenance_pattern.format(id=run_id),
+            Path(simsar_dir).parent / provenance_pattern.format(id=run_id),
+        ])
+
+    json_path = next((p for p in candidates if p.exists()), None)
+    if json_path is None:
+        return "unknown", False, None
+
+    interactions = _read_interactions_from_run_json(json_path)
+    if not interactions:
+        return "unknown", False, json_path
+
+    unknown = [x for x in interactions if x not in KNOWN_INTERACTIONS]
+    if unknown:
+        raise ValueError(
+            f"Unknown interaction(s) in {json_path.name}: {', '.join(unknown)}"
+        )
+
+    use_excavation_gap_rule = any(
+        x in EXCAVATION_INTERACTIONS for x in interactions
+    )
+    return "+".join(interactions), use_excavation_gap_rule, json_path
+
+
+# =============================================================================
+# RASTER / INTENSITY HELPERS
+# =============================================================================
+
+def log_intensity(data: np.ndarray) -> np.ndarray:
+    data = np.asarray(data, dtype=np.float32)
+    out = np.full(data.shape, np.nan, dtype=np.float32)
+    valid = np.isfinite(data) & (data > 0)
+    out[valid] = 10.0 * np.log10(data[valid])
+    return out
+
+
+def _validate_geometry(shape: Tuple[int, int]) -> None:
+    nrows, ncols = shape
+    if INVERSION_ROW_MAX >= nrows:
+        raise ValueError(
+            f"Inversion row {INVERSION_ROW_MAX} is outside raster with {nrows} rows."
+        )
+    if PROFILE_X2 >= ncols:
+        raise ValueError(
+            f"Profile x={PROFILE_X2} is outside raster with {ncols} columns."
+        )
+
+
+def _read_dense_corridor(
+    path: Path,
+    *,
+    pad: int = 0,
+) -> Tuple[np.ndarray, int, int, Tuple[int, int]]:
+    path = Path(path)
+
+    with rasterio.open(path) as src:
+        full_shape = (src.height, src.width)
+        _validate_geometry(full_shape)
+
+        row0 = max(0, INVERSION_ROW_MIN - pad)
+        row1 = min(src.height, INVERSION_ROW_MAX + 1 + pad)
+        col0 = max(0, PROFILE_X1 - pad)
+        col1 = min(src.width, PROFILE_X2 + 1 + pad)
+
+        arr = src.read(
+            1,
+            window=Window(
+                col_off=col0,
+                row_off=row0,
+                width=col1 - col0,
+                height=row1 - row0,
+            ),
+            masked=True,
+        )
+
+    if np.ma.isMaskedArray(arr):
+        data = arr.filled(np.nan).astype(np.float32)
+    else:
+        data = np.asarray(arr, dtype=np.float32)
+
+    return data, row0, col0, full_shape
+
+
+def _extract_dense_profiles(
+    data: np.ndarray,
+    row0: int,
+    col0: int,
+) -> Dict[int, np.ndarray]:
+    local_x1 = PROFILE_X1 - col0
+    local_x2 = PROFILE_X2 - col0
+    expected = PROFILE_X2 - PROFILE_X1 + 1
+
+    profiles: Dict[int, np.ndarray] = {}
+
+    for row in INVERSION_ROWS:
+        local_row = row - row0
+        profile = data[local_row, local_x1:local_x2 + 1]
+        if profile.size != expected:
+            raise ValueError(
+                f"Row {row} has {profile.size} samples; expected {expected}."
+            )
+        profiles[row] = np.asarray(profile, dtype=np.float32)
+
+    return profiles
+
+
+def read_radar_crop_db(
+    path: Path,
+    *,
+    expected_shape: Optional[Tuple[int, int]] = None,
+    add_epsilon: bool = False,
+) -> np.ndarray:
+    path = Path(path)
+
+    with rasterio.open(path) as src:
+        shape = (src.height, src.width)
+        if expected_shape is not None and shape != expected_shape:
+            raise ValueError(
+                f"Raster shape differs from MLI: {shape} != {expected_shape}"
+            )
+
+        if IMAGE_X2 >= src.width or IMAGE_Y2 >= src.height:
+            raise ValueError("Requested diagnostic crop falls outside raster.")
+
+        arr = src.read(
+            1,
+            window=Window(
+                col_off=IMAGE_X1,
+                row_off=IMAGE_Y1,
+                width=IMAGE_X2 - IMAGE_X1 + 1,
+                height=IMAGE_Y2 - IMAGE_Y1 + 1,
+            ),
+            masked=True,
+        )
+
+    if np.ma.isMaskedArray(arr):
+        linear = arr.filled(np.nan).astype(np.float32)
+    else:
+        linear = np.asarray(arr, dtype=np.float32)
+
+    if add_epsilon:
+        linear = linear + 1e-12
+
+    return log_intensity(linear)
+
+
+# =============================================================================
+# MLI / SIMSAR PREPARATION
+# =============================================================================
+
+def prepare_mli_dense_profiles(
+    mli_tif: Path,
+    *,
+    median_size: int = 15,
+) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray], Tuple[int, int]]:
+    if median_size < 1 or median_size % 2 == 0:
+        raise ValueError("median_size must be a positive odd integer.")
+
+    pad = median_size // 2
+    mli_linear, row0, col0, full_shape = _read_dense_corridor(
+        Path(mli_tif), pad=pad
+    )
+
+    valid = np.isfinite(mli_linear) & (mli_linear > 0)
+    if not np.any(valid):
+        raise ValueError(
+            "MLI inversion corridor contains no finite positive pixels."
+        )
+
+    work = mli_linear.copy()
+    fill_value = float(np.median(mli_linear[valid]))
+    work[~valid] = fill_value
+
+    filtered_linear = median_filter(
+        work,
+        size=median_size,
+        mode="nearest",
+    ).astype(np.float32)
+    filtered_linear[~valid] = np.nan
+
+    raw_linear = _extract_dense_profiles(mli_linear, row0, col0)
+    filtered_linear_profiles = _extract_dense_profiles(
+        filtered_linear, row0, col0
+    )
+
+    raw_db = {
+        row: log_intensity(values)
+        for row, values in raw_linear.items()
+    }
+    filtered_db = {
+        row: log_intensity(values)
+        for row, values in filtered_linear_profiles.items()
+    }
+
+    return raw_db, filtered_db, full_shape
+
+
+def read_simsar_dense_profiles(
+    simsar_tif: Path,
+    *,
+    expected_shape: Tuple[int, int],
+    median_size: int = 3,
+) -> Dict[int, np.ndarray]:
+    """Read SimSAR profiles after a small 2-D median filter.
+
+    The filter is applied in linear intensity before conversion to dB.
+    A 3 x 3 kernel suppresses isolated/pixelated layover returns in both
+    azimuth and range, making the picked edge more spatially continuous.
+
+    The original SimSAR valid/no-data mask is restored after filtering so
+    shadow gaps are not filled in or removed by the median operation.
+    Set ``median_size=1`` to disable this SimSAR-specific filter.
+    """
+    median_size = int(median_size)
+    if median_size < 1 or median_size % 2 == 0:
+        raise ValueError(
+            "SimSAR median_size must be a positive odd integer."
+        )
+
+    pad = median_size // 2
+    data, row0, col0, full_shape = _read_dense_corridor(
+        Path(simsar_tif), pad=pad
+    )
+
+    if full_shape != expected_shape:
+        raise ValueError(
+            "sim_sar and MLI raster shapes differ: "
+            f"sim_sar={full_shape}, MLI={expected_shape}. "
+            "No resampling is performed."
+        )
+
+    original_valid = np.isfinite(data) & (data > 0)
+
+    if median_size > 1:
+        # Use zero for no-data while calculating the median. This is fast and
+        # conservative near shadow boundaries; critically, the ORIGINAL mask
+        # is restored below so filtering can never bridge a shadow gap.
+        work = np.where(original_valid, data, 0.0).astype(np.float32)
+        filtered = median_filter(
+            work,
+            size=(median_size, median_size),
+            mode="nearest",
+        ).astype(np.float32)
+        filtered[~original_valid] = np.nan
+    else:
+        filtered = np.asarray(data, dtype=np.float32).copy()
+        filtered[~original_valid] = np.nan
+
+    profiles_linear = _extract_dense_profiles(filtered, row0, col0)
+    return {
+        row: log_intensity(values + 1e-12)
+        for row, values in profiles_linear.items()
+    }
+
+
+# =============================================================================
+# PEAK PICKING
+# =============================================================================
+
+def _interpolate_finite_1d(values: np.ndarray) -> Optional[np.ndarray]:
+    values = np.asarray(values, dtype=float)
+    finite = np.isfinite(values)
+    if finite.sum() < 3:
+        return None
+
+    x = np.arange(values.size, dtype=float)
+    out = values.copy()
+    out[~finite] = np.interp(x[~finite], x[finite], values[finite])
+    return out
+
+
+def _finite_runs(mask: np.ndarray) -> List[Tuple[int, int]]:
+    mask = np.asarray(mask, dtype=bool)
+    if mask.size == 0 or not np.any(mask):
+        return []
+
+    padded = np.concatenate(([False], mask, [False]))
+    changes = np.diff(padded.astype(np.int8))
+    starts = np.flatnonzero(changes == 1)
+    stops = np.flatnonzero(changes == -1)
+    return [(int(a), int(b)) for a, b in zip(starts, stops)]
+
+
+def has_internal_nodata_gap(
+    profile_db: np.ndarray,
+    *,
+    shadow_start_x: float,
+) -> bool:
+    x_pixels = np.arange(PROFILE_X1, PROFILE_X2 + 1, dtype=float)
+    y = np.asarray(profile_db, dtype=float)[
+        x_pixels >= float(shadow_start_x)
+    ]
+    return len(_finite_runs(np.isfinite(y))) >= 2
+
+
+def find_post_shadow_peak(
+    profile_db: np.ndarray,
+    *,
+    shadow_start_x: float,
+    peak_sigma: float = 1.5,
+    prominence_db: float = 2.0,
+    min_distance_pixels: int = 3,
+    peak_mode: str = "first",
+    respect_internal_nodata_gaps: bool = False,
+    min_segment_pixels: int = 5,
+    allow_boundary_peak: bool = False,
+) -> Optional[PeakPick]:
+    if peak_mode not in {"first", "most_prominent"}:
+        raise ValueError(
+            "peak_mode must be 'first' or 'most_prominent'."
+        )
+
+    x_pixels = np.arange(PROFILE_X1, PROFILE_X2 + 1, dtype=float)
+    profile_db = np.asarray(profile_db, dtype=float)
+
+    if profile_db.size != x_pixels.size:
+        raise ValueError(
+            f"Profile has {profile_db.size} samples; "
+            f"expected {x_pixels.size}."
+        )
+
+    search = x_pixels >= float(shadow_start_x)
+    x = x_pixels[search]
+    y = profile_db[search]
+
+    if respect_internal_nodata_gaps:
+        runs = _finite_runs(np.isfinite(y))
+        if not runs:
+            return None
+
+        # For excavation profiles, an internal no-data interval represents a
+        # shadow section. If there are multiple shadow/data sections, search
+        # the FIRST finite section immediately after the first internal shadow
+        # gap rather than jumping to the final finite section of the profile.
+        #
+        # finite run 0  -> data before the first internal shadow
+        # finite run 1  -> data immediately after the first internal shadow
+        # finite run 2+ -> later returns after subsequent shadow sections
+        run_index = 1 if len(runs) >= 2 else 0
+        start, stop = runs[run_index]
+        if (stop - start) < max(3, int(min_segment_pixels)):
+            return None
+
+        x = x[start:stop]
+        y_work = np.asarray(y[start:stop], dtype=float)
+    else:
+        y_work = _interpolate_finite_1d(y)
+        if y_work is None:
+            return None
+
+    if peak_sigma > 0:
+        y_smooth = gaussian_filter1d(
+            y_work, sigma=peak_sigma, mode="nearest"
+        )
+    else:
+        y_smooth = y_work
+
+    peaks, properties = find_peaks(
+        y_smooth,
+        prominence=prominence_db,
+        distance=max(1, int(min_distance_pixels)),
+    )
+
+    # scipy.signal.find_peaks() never considers the first sample of an
+    # array to be a peak because it has no left-hand neighbour. For SimSAR
+    # profiles this matters when the physically relevant bright return
+    # occurs immediately at the first valid pixel after a shadow/no-data
+    # section. In that case, allow the segment boundary itself to be a
+    # candidate if the smoothed signal falls away immediately to the right.
+    #
+    # This option is enabled for SimSAR only; MLI picking is unchanged.
+    boundary_pick: Optional[PeakPick] = None
+    if allow_boundary_peak and y_smooth.size >= 2 and y_smooth[0] > y_smooth[1]:
+        # Estimate a right-sided prominence only for diagnostics/ranking.
+        # The boundary candidate is not rejected by the normal prominence
+        # threshold because a conventional two-sided prominence is undefined
+        # at the edge of the valid segment.
+        window = min(
+            y_smooth.size,
+            max(3, 1 + 2 * max(1, int(min_distance_pixels))),
+        )
+        right_min = float(np.min(y_smooth[1:window]))
+        boundary_prominence = max(0.0, float(y_smooth[0]) - right_min)
+        boundary_pick = PeakPick(
+            x_pixel=float(x[0]),
+            intensity_db=float(y_smooth[0]),
+            prominence_db=boundary_prominence,
+        )
+
+    if peak_mode == "first":
+        if boundary_pick is not None:
+            return boundary_pick
+        if peaks.size == 0:
+            return None
+        chosen = 0
+    else:
+        if peaks.size == 0:
+            return boundary_pick
+        chosen = int(np.argmax(properties["prominences"]))
+        if (
+            boundary_pick is not None
+            and boundary_pick.prominence_db
+            > float(properties["prominences"][chosen])
+        ):
+            return boundary_pick
+
+    idx = int(peaks[chosen])
+    return PeakPick(
+        x_pixel=float(x[idx]),
+        intensity_db=float(y_smooth[idx]),
+        prominence_db=float(properties["prominences"][chosen]),
+    )
+
+
+
+def find_post_shadow_candidates(
+    profile_db: np.ndarray,
+    *,
+    shadow_start_x: float,
+    peak_sigma: float,
+    prominence_db: float,
+    min_distance_pixels: int,
+    respect_internal_nodata_gaps: bool = False,
+    min_segment_pixels: int = 5,
+    allow_boundary_peak: bool = True,
+) -> List[PeakPick]:
+    """Return all plausible peaks in the relevant post-shadow data section."""
+    x_pixels = np.arange(PROFILE_X1, PROFILE_X2 + 1, dtype=float)
+    profile_db = np.asarray(profile_db, dtype=float)
+
+    if profile_db.size != x_pixels.size:
+        raise ValueError(
+            f"Profile has {profile_db.size} samples; expected {x_pixels.size}."
+        )
+
+    keep = x_pixels >= float(shadow_start_x)
+    x = x_pixels[keep]
+    y = profile_db[keep]
+
+    if respect_internal_nodata_gaps:
+        runs = _finite_runs(np.isfinite(y))
+        if not runs:
+            return []
+        # If the profile contains an internal shadow, search the first data
+        # section after it. Otherwise use the only finite section available.
+        start, stop = runs[1 if len(runs) >= 2 else 0]
+        if (stop - start) < max(3, int(min_segment_pixels)):
+            return []
+        x = x[start:stop]
+        y_work = np.asarray(y[start:stop], dtype=float)
+    else:
+        y_work = _interpolate_finite_1d(y)
+        if y_work is None:
+            return []
+
+    if peak_sigma > 0:
+        y_smooth = gaussian_filter1d(y_work, sigma=peak_sigma, mode="nearest")
+    else:
+        y_smooth = y_work
+
+    peaks, properties = find_peaks(
+        y_smooth,
+        prominence=prominence_db,
+        distance=max(1, int(min_distance_pixels)),
+    )
+
+    candidates = [
+        PeakPick(
+            x_pixel=float(x[int(idx)]),
+            intensity_db=float(y_smooth[int(idx)]),
+            prominence_db=float(properties["prominences"][i]),
+        )
+        for i, idx in enumerate(peaks)
+    ]
+
+    # scipy does not classify the first array sample as a peak. For SimSAR,
+    # that first valid sample can be the bright return immediately after a
+    # shadow, so include it when the signal falls away to the right.
+    if allow_boundary_peak and y_smooth.size >= 2 and y_smooth[0] > y_smooth[1]:
+        window = min(
+            y_smooth.size,
+            max(3, 1 + 2 * max(1, int(min_distance_pixels))),
+        )
+        right_min = float(np.min(y_smooth[1:window]))
+        boundary = PeakPick(
+            x_pixel=float(x[0]),
+            intensity_db=float(y_smooth[0]),
+            prominence_db=max(0.0, float(y_smooth[0]) - right_min),
+        )
+        candidates.append(boundary)
+
+    candidates.sort(key=lambda p: p.x_pixel)
+    return candidates
+
+
+def pick_continuous_simsar_edge(
+    profiles_db: Mapping[int, np.ndarray],
+    *,
+    peak_sigma: float,
+    prominence_db: float,
+    min_distance_pixels: int,
+    respect_internal_nodata_gaps: bool,
+    max_jump_pixels: float = 4.0,
+    continuity_penalty: float = 0.25,
+) -> Dict[int, Optional[PeakPick]]:
+    """Pick one spatially continuous SimSAR edge across the azimuth rows.
+
+    Each row contributes all valid post-shadow peak candidates. A small
+    dynamic-programming search chooses a path through them. Earlier peaks are
+    mildly preferred, large jumps cost more, and jumps beyond ``max_jump_pixels``
+    per azimuth row are not allowed. Missing rows are permitted.
+    """
+    if max_jump_pixels <= 0:
+        raise ValueError("max_jump_pixels must be > 0.")
+    if continuity_penalty < 0:
+        raise ValueError("continuity_penalty must be >= 0.")
+
+    rows = list(INVERSION_ROWS)
+    candidates_by_row = {
+        row: find_post_shadow_candidates(
+            profiles_db[row],
+            shadow_start_x=SHADOW_START_BY_ROW[row],
+            peak_sigma=peak_sigma,
+            prominence_db=prominence_db,
+            min_distance_pixels=min_distance_pixels,
+            respect_internal_nodata_gaps=respect_internal_nodata_gaps,
+            allow_boundary_peak=True,
+        )
+        for row in rows
+    }
+
+    # State: (cost, last_x, last_selected_row, picks_so_far).
+    # The fixed penalties are deliberately simple: a missing row is preferable
+    # to a large jump, while a later peak is allowed when it makes the edge
+    # substantially smoother.
+    missing_penalty = 1.5
+    later_peak_penalty = 0.35
+    states = [(0.0, None, None, {})]
+
+    for row in rows:
+        candidates = candidates_by_row[row]
+        next_states = []
+
+        for cost, last_x, last_row, picks in states:
+            skipped = dict(picks)
+            skipped[row] = None
+            next_states.append((cost + missing_penalty, last_x, last_row, skipped))
+
+            for rank, peak in enumerate(candidates):
+                jump_cost = 0.0
+                if last_x is not None and last_row is not None:
+                    row_gap = max(1, row - last_row)
+                    jump = abs(peak.x_pixel - last_x)
+                    if jump > max_jump_pixels * row_gap:
+                        continue
+                    jump_cost = continuity_penalty * jump
+
+                chosen = dict(picks)
+                chosen[row] = peak
+                next_states.append((
+                    cost + jump_cost + later_peak_penalty * rank,
+                    peak.x_pixel,
+                    row,
+                    chosen,
+                ))
+
+        # Paths with the same last selected peak have the same future options.
+        # Keep only the cheapest representative to stop the state set growing.
+        best = {}
+        for state in next_states:
+            cost, last_x, last_row, _ = state
+            key = (last_x, last_row)
+            if key not in best or cost < best[key][0]:
+                best[key] = state
+        states = list(best.values())
+
+    if not states:
+        return {row: None for row in rows}
+
+    best_path = min(states, key=lambda state: state[0])[3]
+    return {row: best_path.get(row) for row in rows}
+
+def pick_dense_profile_set(
+    profiles_db: Mapping[int, np.ndarray],
+    *,
+    peak_sigma: float,
+    prominence_db: float,
+    min_distance_pixels: int,
+    peak_mode: str,
+    respect_internal_nodata_gaps: bool = False,
+    allow_boundary_peak: bool = False,
+) -> Dict[int, Optional[PeakPick]]:
+    picks: Dict[int, Optional[PeakPick]] = {}
+
+    for row in INVERSION_ROWS:
+        picks[row] = find_post_shadow_peak(
+            profiles_db[row],
+            shadow_start_x=SHADOW_START_BY_ROW[row],
+            peak_sigma=peak_sigma,
+            prominence_db=prominence_db,
+            min_distance_pixels=min_distance_pixels,
+            peak_mode=peak_mode,
+            respect_internal_nodata_gaps=respect_internal_nodata_gaps,
+            allow_boundary_peak=allow_boundary_peak,
+        )
+
+    return picks
+
+
+# =============================================================================
+# SCORING / TABLES
+# =============================================================================
+
+def rmse(values: Sequence[float]) -> float:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return np.nan
+    return float(np.sqrt(np.mean(arr ** 2)))
+
+
+def mae(values: Sequence[float]) -> float:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return np.nan
+    return float(np.mean(np.abs(arr)))
+
+
+def observed_dense_peak_table(
+    raw_picks: Mapping[int, Optional[PeakPick]],
+    filtered_picks: Mapping[int, Optional[PeakPick]],
+) -> pd.DataFrame:
+    rows = []
+
+    for row in INVERSION_ROWS:
+        raw = raw_picks[row]
+        filt = filtered_picks[row]
+
+        raw_x = np.nan if raw is None else raw.x_pixel
+        filt_x = np.nan if filt is None else filt.x_pixel
+        delta_px = (
+            filt_x - raw_x
+            if np.isfinite(raw_x) and np.isfinite(filt_x)
+            else np.nan
+        )
+
+        rows.append({
+            "azimuth_row": row,
+            "plot_profile": (
+                plot_label_for_row(row)
+                if row in PLOT_PROFILE_ROWS
+                else ""
+            ),
+            "shadow_start_x": SHADOW_START_BY_ROW[row],
+            "raw_peak_x_px": raw_x,
+            "raw_peak_prominence_db": (
+                np.nan if raw is None else raw.prominence_db
+            ),
+            "filtered_peak_x_px": filt_x,
+            "filtered_peak_prominence_db": (
+                np.nan if filt is None else filt.prominence_db
+            ),
+            "filtered_minus_raw_px": delta_px,
+            "filtered_minus_raw_m": (
+                delta_px * RANGE_PIXEL_SPACING_M
+                if np.isfinite(delta_px)
+                else np.nan
+            ),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def score_dense_model(
+    run_id: str,
+    sim_picks: Mapping[int, Optional[PeakPick]],
+    raw_mli_picks: Mapping[int, Optional[PeakPick]],
+    filtered_mli_picks: Mapping[int, Optional[PeakPick]],
+    *,
+    min_coverage: float = 1.0,
+) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
+    if not (0 < min_coverage <= 1.0):
+        raise ValueError("min_coverage must be in (0, 1].")
+
+    residual_rows: List[Dict[str, object]] = []
+    filtered_errors_m: List[float] = []
+    raw_errors_m: List[float] = []
+
+    observed_valid_rows = [
+        row for row in INVERSION_ROWS
+        if filtered_mli_picks[row] is not None
+    ]
+
+    if not observed_valid_rows:
+        return ({
+            "run_id": run_id,
+            "status": "no_filtered_mli_peaks",
+            "n_rows_total": len(INVERSION_ROWS),
+            "n_rows_observed_valid": 0,
+            "n_rows_matched": 0,
+            "coverage": 0.0,
+            "rmse_filtered_m": np.nan,
+            "mae_filtered_m": np.nan,
+            "bias_filtered_m": np.nan,
+            "rmse_raw_m": np.nan,
+        }, residual_rows)
+
+    matched = 0
+
+    for row in INVERSION_ROWS:
+        sim = sim_picks[row]
+        raw = raw_mli_picks[row]
+        filt = filtered_mli_picks[row]
+
+        obs_valid = filt is not None
+        sim_valid = sim is not None
+
+        filtered_error_px = np.nan
+        filtered_error_m = np.nan
+        raw_error_px = np.nan
+        raw_error_m = np.nan
+
+        if obs_valid and sim_valid:
+            assert filt is not None
+            assert sim is not None
+            filtered_error_px = sim.x_pixel - filt.x_pixel
+            filtered_error_m = (
+                filtered_error_px * RANGE_PIXEL_SPACING_M
+            )
+            filtered_errors_m.append(filtered_error_m)
+            matched += 1
+
+            if raw is not None:
+                raw_error_px = sim.x_pixel - raw.x_pixel
+                raw_error_m = raw_error_px * RANGE_PIXEL_SPACING_M
+                raw_errors_m.append(raw_error_m)
+
+        residual_rows.append({
+            "run_id": run_id,
+            "azimuth_row": row,
+            "plot_profile": (
+                plot_label_for_row(row)
+                if row in PLOT_PROFILE_ROWS
+                else ""
+            ),
+            "shadow_start_x": SHADOW_START_BY_ROW[row],
+            "filtered_mli_peak_x_px": (
+                np.nan if filt is None else filt.x_pixel
+            ),
+            "filtered_mli_peak_prominence_db": (
+                np.nan if filt is None else filt.prominence_db
+            ),
+            "raw_mli_peak_x_px": (
+                np.nan if raw is None else raw.x_pixel
+            ),
+            "sim_peak_x_px": (
+                np.nan if sim is None else sim.x_pixel
+            ),
+            "sim_peak_prominence_db": (
+                np.nan if sim is None else sim.prominence_db
+            ),
+            "error_filtered_px": filtered_error_px,
+            "error_filtered_m": filtered_error_m,
+            "error_raw_px": raw_error_px,
+            "error_raw_m": raw_error_m,
+        })
+
+    n_obs = len(observed_valid_rows)
+    coverage = matched / n_obs
+    status = (
+        "ok"
+        if coverage >= min_coverage
+        else "insufficient_peak_coverage"
+    )
+
+    filtered_arr = np.asarray(filtered_errors_m, dtype=float)
+
+    summary: Dict[str, object] = {
+        "run_id": run_id,
+        "status": status,
+        "n_rows_total": len(INVERSION_ROWS),
+        "n_rows_observed_valid": n_obs,
+        "n_rows_matched": matched,
+        "coverage": coverage,
+        "rmse_filtered_m": (
+            rmse(filtered_errors_m) if status == "ok" else np.nan
+        ),
+        "mae_filtered_m": (
+            mae(filtered_errors_m) if status == "ok" else np.nan
+        ),
+        "bias_filtered_m": (
+            float(np.mean(filtered_arr))
+            if status == "ok" and filtered_arr.size
+            else np.nan
+        ),
+        "rmse_raw_m": (
+            rmse(raw_errors_m) if raw_errors_m else np.nan
+        ),
+    }
+
+    for label, row in zip(PLOT_PROFILE_LABELS, PLOT_PROFILE_ROWS):
+        sim = sim_picks[row]
+        filt = filtered_mli_picks[row]
+        if sim is not None and filt is not None:
+            err_px = sim.x_pixel - filt.x_pixel
+            summary[f"error_filtered_{label}_px"] = err_px
+            summary[f"error_filtered_{label}_m"] = (
+                err_px * RANGE_PIXEL_SPACING_M
+            )
+        else:
+            summary[f"error_filtered_{label}_px"] = np.nan
+            summary[f"error_filtered_{label}_m"] = np.nan
+
+    return summary, residual_rows
+
+
+# =============================================================================
+# PLOTTING HELPERS
+# =============================================================================
+
+def subset_plot_profiles(
+    dense_profiles: Mapping[int, np.ndarray],
+) -> Dict[str, np.ndarray]:
+    return {
+        label: np.asarray(dense_profiles[row], dtype=float)
+        for label, row in zip(
+            PLOT_PROFILE_LABELS, PLOT_PROFILE_ROWS
+        )
+    }
+
+
+def subset_plot_picks(
+    dense_picks: Mapping[int, Optional[PeakPick]],
+) -> Dict[str, Optional[PeakPick]]:
+    return {
+        label: dense_picks[row]
+        for label, row in zip(
+            PLOT_PROFILE_LABELS, PLOT_PROFILE_ROWS
+        )
+    }
+
+
+def _display_shift_to_filtered_mli(
+    sim_profiles: Mapping[str, np.ndarray],
+    filtered_mli_profiles: Mapping[str, np.ndarray],
+) -> float:
+    sim = np.concatenate([
+        np.asarray(sim_profiles[k], dtype=float)
+        for k in PLOT_PROFILE_LABELS
+    ])
+    obs = np.concatenate([
+        np.asarray(filtered_mli_profiles[k], dtype=float)
+        for k in PLOT_PROFILE_LABELS
+    ])
+    common = np.isfinite(sim) & np.isfinite(obs)
+    if not np.any(common):
+        return 0.0
+    return float(
+        np.median(obs[common]) - np.median(sim[common])
+    )
+
+
+def _profile_value_at_pick(
+    profile: np.ndarray,
+    pick: PeakPick,
+) -> float:
+    idx = int(round(pick.x_pixel - PROFILE_X1))
+    if idx < 0 or idx >= len(profile):
+        return np.nan
+    value = float(profile[idx])
+    return value if np.isfinite(value) else np.nan
+
+
+def _dense_edge_arrays(
+    picks: Mapping[int, Optional[PeakPick]],
+) -> Tuple[np.ndarray, np.ndarray]:
+    edge_y = []
+    edge_x = []
+
+    for row_y in INVERSION_ROWS:
+        pick = picks.get(row_y)
+        if pick is not None:
+            edge_y.append(row_y)
+            edge_x.append(pick.x_pixel)
+
+    if not edge_x:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+
+    order = np.argsort(edge_y)
+    return (
+        np.asarray(edge_x, dtype=float)[order],
+        np.asarray(edge_y, dtype=float)[order],
+    )
+
+
+def plot_observed_mli_profiles(
+    filtered_profiles: Mapping[str, np.ndarray],
+    filtered_picks: Mapping[str, Optional[PeakPick]],
+    output_png: Path,
+    *,
+    mli_name: str,
+) -> None:
+    x = np.arange(PROFILE_X1, PROFILE_X2 + 1)
+    fig, axes = plt.subplots(
+        3, 1,
+        figsize=(7.2, 6.6),
+        sharex=True,
+        constrained_layout=True,
+    )
+
+    for ax, label, shadow_start in zip(
+        axes, PLOT_PROFILE_LABELS, PLOT_SHADOW_START_XS
+    ):
+        ax.plot(
+            x,
+            filtered_profiles[label],
+            linewidth=1.35,
+            label="MLI median filtered",
+        )
+
+        filt_pick = filtered_picks[label]
+
+        ax.axvline(
+            shadow_start,
+            linestyle=":",
+            linewidth=0.9,
+            label="Shadow-search start" if label == "A" else None,
+        )
+
+        if filt_pick is not None:
+            ax.axvline(
+                filt_pick.x_pixel,
+                linestyle="-.",
+                linewidth=1.1,
+                label="Filtered peak" if label == "A" else None,
+            )
+
+        ax.set_ylabel(f"{label}\nIntensity (dB)")
+        ax.grid(alpha=0.18, linewidth=0.5)
+        ax.set_xlim(PROFILE_X1, PROFILE_X2)
+
+    axes[-1].set_xlabel("Range pixel")
+    axes[0].legend(frameon=False, ncol=2)
+    fig.suptitle(
+        f"Median-filtered MLI peak positions: {mli_name}"
+    )
+
+    output_png = Path(output_png)
+    output_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_png, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_top_models(
+    top_models: pd.DataFrame,
+    sim_profiles_by_id: Mapping[str, Mapping[str, np.ndarray]],
+    filtered_mli_profiles: Mapping[str, np.ndarray],
+    filtered_mli_picks: Mapping[str, Optional[PeakPick]],
+    sim_picks_by_id: Mapping[
+        str, Mapping[str, Optional[PeakPick]]
+    ],
+    output_png: Path,
+    *,
+    mli_name: str,
+) -> None:
+    if top_models.empty:
+        raise RuntimeError(
+            "No valid models are available to plot."
+        )
+
+    nmodels = len(top_models)
+    fig, axes = plt.subplots(
+        3,
+        nmodels,
+        figsize=(3.1 * nmodels, 8.2),
+        sharex=True,
+        sharey="row",
+        squeeze=False,
+    )
+    x = np.arange(PROFILE_X1, PROFILE_X2 + 1)
+
+    for col, (_, model) in enumerate(top_models.iterrows()):
+        run_id = str(model["run_id"])
+        sim_profiles = sim_profiles_by_id[run_id]
+        sim_picks = sim_picks_by_id[run_id]
+        display_shift = _display_shift_to_filtered_mli(
+            sim_profiles, filtered_mli_profiles
+        )
+
+        for r, (label, shadow_start) in enumerate(zip(
+            PLOT_PROFILE_LABELS,
+            PLOT_SHADOW_START_XS,
+        )):
+            ax = axes[r, col]
+            filt = filtered_mli_profiles[label]
+            sim_raw = np.asarray(
+                sim_profiles[label], dtype=float
+            )
+            sim = np.where(
+                np.isfinite(sim_raw),
+                sim_raw + display_shift,
+                SIMSAR_NODATA_DB,
+            )
+
+            ax.plot(
+                x, filt,
+                linewidth=1.35,
+                label=(
+                    "MLI median filtered"
+                    if (r == 0 and col == 0)
+                    else None
+                ),
+            )
+            ax.plot(
+                x, sim,
+                linewidth=1.15,
+                linestyle="--",
+                label=(
+                    "SimSAR (display shifted)"
+                    if (r == 0 and col == 0)
+                    else None
+                ),
+            )
+            ax.axvline(
+                shadow_start,
+                linewidth=0.8,
+                linestyle=":",
+                alpha=0.7,
+            )
+
+            filt_pick = filtered_mli_picks[label]
+            sim_pick = sim_picks[label]
+
+            if filt_pick is not None:
+                ax.axvline(
+                    filt_pick.x_pixel,
+                    linewidth=0.95,
+                    linestyle="--",
+                    alpha=0.8,
+                )
+            if sim_pick is not None:
+                ax.axvline(
+                    sim_pick.x_pixel,
+                    linewidth=1.15,
+                    linestyle="-.",
+                    alpha=0.9,
+                )
+
+            ax.grid(alpha=0.18, linewidth=0.5)
+            ax.set_xlim(PROFILE_X1, PROFILE_X2)
+            if col == 0:
+                ax.set_ylabel(
+                    f"Profile {label}\nIntensity (dB)"
+                )
+            if r == 2:
+                ax.set_xlabel("Range pixel")
+
+        axes[0, col].set_title(
+            f"Rank {int(model['rank_selected'])}: "
+            f"P.{run_id}.dem\n"
+            f"Dense filtered RMSE = "
+            f"{model['rmse_filtered_m']:.2f} m\n"
+            f"matched {int(model['n_rows_matched'])}/"
+            f"{int(model['n_rows_observed_valid'])} rows",
+            fontsize=9,
+        )
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=3,
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.935),
+    )
+    fig.suptitle(
+        f"Observed MLI vs top {nmodels} models: {mli_name}\n"
+        f"Ranking uses every azimuth row "
+        f"{INVERSION_ROW_MIN}..{INVERSION_ROW_MAX}; "
+        "only A/B/C are plotted",
+        fontsize=11,
+        y=0.985,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.86))
+
+    output_png = Path(output_png)
+    output_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_png, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_top5_image_profile_summary(
+    top_models: pd.DataFrame,
+    simsar_dir: Path,
+    simsar_pattern: str,
+    mli_tif: Path,
+    expected_shape: Tuple[int, int],
+    sim_profiles_by_id: Mapping[str, Mapping[str, np.ndarray]],
+    filtered_mli_profiles: Mapping[str, np.ndarray],
+    filtered_mli_picks: Mapping[str, Optional[PeakPick]],
+    sim_picks_by_id: Mapping[
+        str, Mapping[str, Optional[PeakPick]]
+    ],
+    filtered_mli_picks_dense: Mapping[
+        int, Optional[PeakPick]
+    ],
+    sim_picks_dense_by_id: Mapping[
+        str, Mapping[int, Optional[PeakPick]]
+    ],
+    output_png: Path,
+) -> None:
+    """3 x 5 top-model summary with image and A/B/C profile panels."""
+    if top_models.empty:
+        raise RuntimeError(
+            "No valid models are available for the 3 x 5 plot."
+        )
+
+    models = top_models.head(5).copy()
+    nmodels = len(models)
+    mli_crop_db = read_radar_crop_db(
+        mli_tif,
+        expected_shape=expected_shape,
+    )
+
+    fig, axes = plt.subplots(
+        3,
+        nmodels,
+        figsize=(4.2 * nmodels, 11.2),
+        squeeze=False,
+    )
+    cycle = plt.rcParams["axes.prop_cycle"].by_key().get(
+        "color", []
+    )
+    if len(cycle) < 3:
+        cycle = [f"C{i}" for i in range(3)]
+
+    colors = {
+        label: cycle[i]
+        for i, label in enumerate(PLOT_PROFILE_LABELS)
+    }
+    x = np.arange(PROFILE_X1, PROFILE_X2 + 1)
+
+    mli_edge_x, mli_edge_y = _dense_edge_arrays(
+        filtered_mli_picks_dense
+    )
+
+    for col, (_, model) in enumerate(models.iterrows()):
+        run_id = str(model["run_id"])
+        simsar_tif = (
+            Path(simsar_dir)
+            / simsar_pattern.format(id=run_id)
+        )
+        sim_crop_db = read_radar_crop_db(
+            simsar_tif,
+            expected_shape=expected_shape,
+            add_epsilon=True,
+        )
+
+        sim_profiles = sim_profiles_by_id[run_id]
+        sim_picks = sim_picks_by_id[run_id]
+        display_shift = _display_shift_to_filtered_mli(
+            sim_profiles,
+            filtered_mli_profiles,
+        )
+        sim_crop_display = np.where(
+            np.isfinite(sim_crop_db),
+            sim_crop_db + display_shift,
+            SIMSAR_NODATA_DB,
+        )
+
+        sim_edge_x, sim_edge_y = _dense_edge_arrays(
+            sim_picks_dense_by_id[run_id]
+        )
+
+        # Top: SimSAR image.
+        ax = axes[0, col]
+        ax.imshow(
+            sim_crop_display,
+            cmap="gray",
+            vmin=DISPLAY_VMIN_DB,
+            vmax=DISPLAY_VMAX_DB,
+            origin="upper",
+            extent=[
+                IMAGE_X1,
+                IMAGE_X2 + 1,
+                IMAGE_Y2 + 1,
+                IMAGE_Y1,
+            ],
+            interpolation="nearest",
+        )
+
+        if sim_edge_x.size:
+            ax.plot(
+                sim_edge_x,
+                sim_edge_y,
+                linewidth=2.2,
+                marker=".",
+                markersize=2.5,
+                label="SimSAR picked edge",
+                color="orange",
+                zorder=7,
+            )
+        if mli_edge_x.size:
+            ax.plot(
+                mli_edge_x,
+                mli_edge_y,
+                linewidth=2.2,
+                marker=".",
+                markersize=2.5,
+                label="Filtered MLI picked edge",
+                color="blue",
+                zorder=7,
+            )
+
+        for label, row_y in zip(
+            PLOT_PROFILE_LABELS,
+            PLOT_PROFILE_ROWS,
+        ):
+            color = colors[label]
+            ax.plot(
+                [PROFILE_X1, PROFILE_X2],
+                [row_y, row_y],
+                linewidth=0.8,
+                color=color,
+                alpha=0.65,
+            )
+            ax.text(
+                PROFILE_X1 + 2,
+                row_y - 2,
+                label,
+                color=color,
+                fontsize=8,
+                fontweight="bold",
+                va="bottom",
+            )
+
+        ax.set_xlim(IMAGE_X1, IMAGE_X2)
+        ax.set_ylim(IMAGE_Y2, IMAGE_Y1)
+        ax.set_aspect("equal")
+        ax.set_title(
+            f"Rank {int(model['rank_selected'])}: "
+            f"P.{run_id}.dem\n"
+            f"Dense RMSE = "
+            f"{model['rmse_filtered_m']:.2f} m",
+            fontsize=9,
+        )
+        if col == 0:
+            ax.set_ylabel("SimSAR\nAzimuth line")
+        else:
+            ax.set_yticklabels([])
+
+        # Middle: observed MLI.
+        ax = axes[1, col]
+        ax.imshow(
+            mli_crop_db,
+            cmap="gray",
+            vmin=DISPLAY_VMIN_DB,
+            vmax=DISPLAY_VMAX_DB,
+            origin="upper",
+            extent=[
+                IMAGE_X1,
+                IMAGE_X2 + 1,
+                IMAGE_Y2 + 1,
+                IMAGE_Y1,
+            ],
+            interpolation="nearest",
+        )
+
+        if mli_edge_x.size:
+            ax.plot(
+                mli_edge_x,
+                mli_edge_y,
+                linewidth=2.2,
+                marker=".",
+                markersize=2.5,
+                label="Filtered MLI picked edge",
+                color="blue",
+                zorder=7,
+            )
+        if sim_edge_x.size:
+            ax.plot(
+                sim_edge_x,
+                sim_edge_y,
+                linewidth=2.2,
+                marker=".",
+                markersize=2.5,
+                label="SimSAR picked edge",
+                color="orange",
+                zorder=7,
+            )
+
+        for label, row_y in zip(
+            PLOT_PROFILE_LABELS,
+            PLOT_PROFILE_ROWS,
+        ):
+            color = colors[label]
+            ax.plot(
+                [PROFILE_X1, PROFILE_X2],
+                [row_y, row_y],
+                linewidth=0.8,
+                color=color,
+                alpha=0.65,
+            )
+            ax.text(
+                PROFILE_X1 + 2,
+                row_y - 2,
+                label,
+                color=color,
+                fontsize=8,
+                fontweight="bold",
+                va="bottom",
+            )
+
+        ax.set_xlim(IMAGE_X1, IMAGE_X2)
+        ax.set_ylim(IMAGE_Y2, IMAGE_Y1)
+        ax.set_aspect("equal")
+        ax.set_xlabel("Range pixel")
+        if col == 0:
+            ax.set_ylabel("Observed MLI\nAzimuth line")
+        else:
+            ax.set_yticklabels([])
+
+        # Bottom: A/B/C profiles only.
+        ax = axes[2, col]
+        error_lines = []
+
+        for label in PLOT_PROFILE_LABELS:
+            color = colors[label]
+            filt = np.asarray(
+                filtered_mli_profiles[label],
+                dtype=float,
+            )
+            sim_raw = np.asarray(
+                sim_profiles[label],
+                dtype=float,
+            )
+            sim = np.where(
+                np.isfinite(sim_raw),
+                sim_raw + display_shift,
+                SIMSAR_NODATA_DB,
+            )
+            filt_pick = filtered_mli_picks[label]
+            sim_pick = sim_picks[label]
+
+            ax.plot(
+                x,
+                filt,
+                color=color,
+                linewidth=1.25,
+                linestyle="-",
+            )
+            ax.plot(
+                x,
+                sim,
+                color=color,
+                linewidth=1.05,
+                linestyle="--",
+            )
+
+            if filt_pick is not None:
+                yv = _profile_value_at_pick(filt, filt_pick)
+                if np.isfinite(yv):
+                    ax.scatter(
+                        filt_pick.x_pixel,
+                        yv,
+                        s=28,
+                        marker="x",
+                        color=color,
+                        linewidths=1.2,
+                        zorder=6,
+                    )
+            if sim_pick is not None:
+                yv = _profile_value_at_pick(sim, sim_pick)
+                if np.isfinite(yv):
+                    ax.scatter(
+                        sim_pick.x_pixel,
+                        yv,
+                        s=34,
+                        marker="s",
+                        facecolors="none",
+                        edgecolors=color,
+                        linewidths=1.2,
+                        zorder=7,
+                    )
+
+            if filt_pick is not None and sim_pick is not None:
+                err = (
+                    sim_pick.x_pixel - filt_pick.x_pixel
+                ) * RANGE_PIXEL_SPACING_M
+                error_lines.append(
+                    f"{label}: {err:+.1f} m"
+                )
+            else:
+                error_lines.append(f"{label}: NA")
+
+        ax.set_xlim(PROFILE_X1, PROFILE_X2)
+        ax.grid(alpha=0.18, linewidth=0.5)
+        ax.set_xlabel("Range pixel")
+        if col == 0:
+            ax.set_ylabel("Profile intensity (dB)")
+        ax.text(
+            0.02,
+            0.03,
+            "A/B/C peak error vs filtered MLI\n"
+            + "  ".join(error_lines),
+            transform=ax.transAxes,
+            fontsize=7.5,
+            va="bottom",
+            ha="left",
+            bbox={
+                "facecolor": "white",
+                "alpha": 0.7,
+                "edgecolor": "none",
+            },
+        )
+
+    legend_handles = [
+        Line2D(
+            [0], [0],
+            linestyle="-",
+            linewidth=2.2,
+            marker=".",
+            label="Dense picked edge (image panels)",
+        ),
+        Line2D(
+            [0], [0],
+            linestyle="-",
+            linewidth=1.3,
+            label="MLI median-filtered profile",
+        ),
+        Line2D(
+            [0], [0],
+            linestyle="--",
+            linewidth=1.1,
+            label="SimSAR profile (display shifted)",
+        ),
+        Line2D(
+            [0], [0],
+            marker="x",
+            linestyle="None",
+            label="Filtered MLI peak (A/B/C)",
+        ),
+        Line2D(
+            [0], [0],
+            marker="s",
+            linestyle="None",
+            markerfacecolor="none",
+            label="SimSAR peak (A/B/C)",
+        ),
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        ncol=4,
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.962),
+        fontsize=8,
+    )
+    fig.suptitle(
+        "Top-five dense peak-position inversion\n"
+        f"Ranking and image-edge lines use rows "
+        f"{INVERSION_ROW_MIN}..{INVERSION_ROW_MAX}; "
+        "bottom profiles show A/B/C only",
+        fontsize=12,
+        y=0.995,
+    )
+    fig.tight_layout(
+        rect=(0, 0, 1, 0.93),
+        h_pad=1.0,
+        w_pad=0.6,
+    )
+
+    output_png = Path(output_png)
+    output_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_png, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_many_model_image_grid(
+    ranking: pd.DataFrame,
+    simsar_dir: Path,
+    simsar_pattern: str,
+    mli_tif: Path,
+    expected_shape: Tuple[int, int],
+    sim_profiles_by_id: Mapping[
+        str, Mapping[str, np.ndarray]
+    ],
+    filtered_mli_profiles: Mapping[str, np.ndarray],
+    filtered_mli_picks_dense: Mapping[
+        int, Optional[PeakPick]
+    ],
+    sim_picks_dense_by_id: Mapping[
+        str, Mapping[int, Optional[PeakPick]]
+    ],
+    output_png: Path,
+    *,
+    grid_rows: int = 8,
+    grid_cols: int = 8,
+) -> None:
+    """
+    Plot one observed MLI panel followed by many ranked SimSAR models.
+
+    (0, 0) is the observed MLI. All other cells are valid ranked models,
+    ordered from lowest to highest filtered-MLI RMSE.
+    """
+    grid_rows = int(grid_rows)
+    grid_cols = int(grid_cols)
+
+    if grid_rows < 1 or grid_cols < 1:
+        raise ValueError(
+            "grid_rows and grid_cols must both be >= 1."
+        )
+    if grid_rows * grid_cols < 2:
+        raise ValueError(
+            "Overview grid must contain at least 2 panels."
+        )
+
+    valid_ranking = ranking[
+        (ranking["status"] == "ok")
+        & np.isfinite(ranking["rmse_filtered_m"])
+    ].copy()
+
+    if valid_ranking.empty:
+        raise RuntimeError(
+            "No valid ranked models are available "
+            "for the overview grid."
+        )
+
+    max_models = grid_rows * grid_cols - 1
+    models = valid_ranking.head(max_models).copy()
+
+    mli_crop_db = read_radar_crop_db(
+        mli_tif,
+        expected_shape=expected_shape,
+    )
+    mli_edge_x, mli_edge_y = _dense_edge_arrays(
+        filtered_mli_picks_dense
+    )
+
+    fig, axes = plt.subplots(
+        grid_rows,
+        grid_cols,
+        figsize=(2.4 * grid_cols, 2.55 * grid_rows),
+        squeeze=False,
+    )
+
+    cycle = plt.rcParams["axes.prop_cycle"].by_key().get(
+        "color", []
+    )
+    if len(cycle) < 3:
+        cycle = [f"C{i}" for i in range(3)]
+
+    colors = {
+        label: cycle[i]
+        for i, label in enumerate(PLOT_PROFILE_LABELS)
+    }
+
+    def decorate(
+        ax,
+        *,
+        show_xlabel: bool,
+        show_ylabel: bool,
+    ) -> None:
+        for label, row_y in zip(
+            PLOT_PROFILE_LABELS,
+            PLOT_PROFILE_ROWS,
+        ):
+            color = colors[label]
+            ax.plot(
+                [PROFILE_X1, PROFILE_X2],
+                [row_y, row_y],
+                linewidth=0.45,
+                color=color,
+                alpha=0.45,
+            )
+            ax.text(
+                PROFILE_X1 + 2,
+                row_y - 2,
+                label,
+                color=color,
+                fontsize=5.5,
+                fontweight="bold",
+                va="bottom",
+            )
+
+        ax.set_xlim(IMAGE_X1, IMAGE_X2)
+        ax.set_ylim(IMAGE_Y2, IMAGE_Y1)
+        ax.set_aspect("equal")
+        ax.tick_params(labelsize=5.5, length=2)
+
+        if show_xlabel:
+            ax.set_xlabel("Range pixel", fontsize=6.5)
+        else:
+            ax.set_xticklabels([])
+
+        if show_ylabel:
+            ax.set_ylabel("Azimuth line", fontsize=6.5)
+        else:
+            ax.set_yticklabels([])
+
+    # (0, 0): observed MLI only once.
+    ax = axes[0, 0]
+    ax.imshow(
+        mli_crop_db,
+        cmap="gray",
+        vmin=DISPLAY_VMIN_DB,
+        vmax=DISPLAY_VMAX_DB,
+        origin="upper",
+        extent=[
+            IMAGE_X1,
+            IMAGE_X2 + 1,
+            IMAGE_Y2 + 1,
+            IMAGE_Y1,
+        ],
+        interpolation="nearest",
+    )
+    if mli_edge_x.size:
+        ax.plot(
+            mli_edge_x,
+            mli_edge_y,
+            linewidth=1.8,
+            marker=".",
+            markersize=2.0,
+            color="blue",
+            zorder=7,
+        )
+    decorate(
+        ax,
+        show_xlabel=(grid_rows == 1),
+        show_ylabel=True,
+    )
+    ax.set_title(
+        "Observed MLI\nfiltered picked edge",
+        fontsize=7.5,
+    )
+
+    slots = [
+        (r, c)
+        for r in range(grid_rows)
+        for c in range(grid_cols)
+        if (r, c) != (0, 0)
+    ]
+
+    for (r, c), (_, model) in zip(
+        slots,
+        models.iterrows(),
+    ):
+        ax = axes[r, c]
+        run_id = str(model["run_id"])
+        simsar_tif = (
+            Path(simsar_dir)
+            / simsar_pattern.format(id=run_id)
+        )
+
+        sim_crop_db = read_radar_crop_db(
+            simsar_tif,
+            expected_shape=expected_shape,
+            add_epsilon=True,
+        )
+
+        sim_profiles = sim_profiles_by_id[run_id]
+        display_shift = _display_shift_to_filtered_mli(
+            sim_profiles,
+            filtered_mli_profiles,
+        )
+
+        sim_crop_display = np.where(
+            np.isfinite(sim_crop_db),
+            sim_crop_db + display_shift,
+            SIMSAR_NODATA_DB,
+        )
+
+        ax.imshow(
+            sim_crop_display,
+            cmap="gray",
+            vmin=DISPLAY_VMIN_DB,
+            vmax=DISPLAY_VMAX_DB,
+            origin="upper",
+            extent=[
+                IMAGE_X1,
+                IMAGE_X2 + 1,
+                IMAGE_Y2 + 1,
+                IMAGE_Y1,
+            ],
+            interpolation="nearest",
+        )
+
+        sim_edge_x, sim_edge_y = _dense_edge_arrays(
+            sim_picks_dense_by_id[run_id]
+        )
+
+        if sim_edge_x.size:
+            ax.plot(
+                sim_edge_x,
+                sim_edge_y,
+                linewidth=1.5,
+                marker=".",
+                markersize=1.8,
+                color="orange",
+                zorder=8,
+            )
+
+        if mli_edge_x.size:
+            ax.plot(
+                mli_edge_x,
+                mli_edge_y,
+                linewidth=1.25,
+                marker=".",
+                markersize=1.5,
+                color="blue",
+                zorder=7,
+            )
+
+        decorate(
+            ax,
+            show_xlabel=(r == grid_rows - 1),
+            show_ylabel=(c == 0),
+        )
+
+        ax.set_title(
+            f"#{int(model['rank_selected'])} "
+            f"P.{run_id}\n"
+            f"RMSE {float(model['rmse_filtered_m']):.1f} m",
+            fontsize=6.5,
+        )
+
+    for r, c in slots[len(models):]:
+        axes[r, c].axis("off")
+
+    fig.suptitle(
+        f"Observed MLI + top {len(models)} ranked SimSAR models\n"
+        f"Blue = filtered MLI picked edge; "
+        f"orange = SimSAR picked edge; "
+        f"rows {INVERSION_ROW_MIN}..{INVERSION_ROW_MAX}",
+        fontsize=11,
+        y=0.997,
+    )
+
+    fig.tight_layout(
+        rect=(0, 0, 1, 0.975),
+        h_pad=0.6,
+        w_pad=0.25,
+    )
+
+    output_png = Path(output_png)
+    output_png.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    fig.savefig(
+        output_png,
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+# =============================================================================
+# MAIN WORKFLOW
+# =============================================================================
+
+def build_run_ids(
+    start: str,
+    end: str,
+    *,
+    minimum_width: int = 4,
+) -> List[str]:
+    start_i = int(start)
+    end_i = int(end)
+    if end_i < start_i:
+        raise ValueError("id_end must be >= id_start.")
+    width = max(
+        minimum_width,
+        len(str(start)),
+        len(str(end)),
+    )
+    return [
+        f"{i:0{width}d}"
+        for i in range(start_i, end_i + 1)
+    ]
+
+
+def run_peak_inversion(
+    mli_tif: Path,
+    simsar_dir: Path,
+    run_ids: Iterable[str],
+    output_dir: Path,
+    *,
+    simsar_pattern: str = "P.{id}.sim_sar.radar.tif",
+    median_size: int = 15,
+    simsar_median_size: int = 3,
+    peak_sigma: float = 1.5,
+    peak_prominence_db: float = 2.0,
+    peak_distance_pixels: int = 3,
+    peak_mode: str = "first",
+    min_coverage: float = 1.0,
+    top_n: int = 5,
+    azimuth_min: int = DEFAULT_INVERSION_ROW_MIN,
+    azimuth_max: int = DEFAULT_INVERSION_ROW_MAX,
+    interaction: str = "auto",
+    provenance_dir: Optional[Path] = None,
+    provenance_pattern: str = "{id}.json",
+    overview_grid_rows: int = 8,
+    overview_grid_cols: int = 8,
+    simsar_max_jump_pixels: float = 4.0,
+    simsar_continuity_penalty: float = 0.25,
+) -> Dict[str, object]:
+    _configure_inversion_geometry(
+        azimuth_min,
+        azimuth_max,
+    )
+
+    overview_grid_rows = int(overview_grid_rows)
+    overview_grid_cols = int(overview_grid_cols)
+    simsar_median_size = int(simsar_median_size)
+
+    if simsar_max_jump_pixels <= 0:
+        raise ValueError("simsar_max_jump_pixels must be > 0.")
+    if simsar_continuity_penalty < 0:
+        raise ValueError("simsar_continuity_penalty must be >= 0.")
+
+    if simsar_median_size < 1 or simsar_median_size % 2 == 0:
+        raise ValueError(
+            "simsar_median_size must be a positive odd integer."
+        )
+
+    if overview_grid_rows < 1 or overview_grid_cols < 1:
+        raise ValueError(
+            "overview_grid_rows and overview_grid_cols "
+            "must both be >= 1."
+        )
+    if overview_grid_rows * overview_grid_cols < 2:
+        raise ValueError(
+            "overview grid must contain at least 2 panels."
+        )
+
+    mli_tif = Path(mli_tif).resolve()
+    simsar_dir = Path(simsar_dir).resolve()
+    output_dir = Path(output_dir).resolve()
+    provenance_dir = (
+        None
+        if provenance_dir is None
+        else Path(provenance_dir).resolve()
+    )
+
+    if not mli_tif.exists():
+        raise FileNotFoundError(mli_tif)
+    if not simsar_dir.exists():
+        raise FileNotFoundError(simsar_dir)
+    if (
+        provenance_dir is not None
+        and not provenance_dir.exists()
+    ):
+        raise FileNotFoundError(provenance_dir)
+    if not (0 < min_coverage <= 1.0):
+        raise ValueError(
+            "min_coverage must be in (0, 1]."
+        )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    run_ids = [str(x) for x in run_ids]
+    if not run_ids:
+        raise ValueError("No run IDs supplied.")
+
+    print("\n" + "=" * 80)
+    print("CONTINUOUS-EDGE SimSAR MODEL INVERSION")
+    print("=" * 80)
+    print(f"MLI:                    {mli_tif}")
+    print(f"sim_sar directory:      {simsar_dir}")
+    print(f"models requested:       {len(run_ids)}")
+    print(
+        f"inversion rows:         "
+        f"{INVERSION_ROW_MIN}..{INVERSION_ROW_MAX} "
+        f"({len(INVERSION_ROWS)} rows)"
+    )
+    print(
+        f"plot rows only:         {PLOT_PROFILE_ROWS}"
+    )
+    print(
+        f"profile x range:        "
+        f"{PROFILE_X1}..{PROFILE_X2}"
+    )
+    print(
+        f"MLI median filter:      "
+        f"{median_size} x {median_size}"
+    )
+    print(
+        f"SimSAR median filter:   "
+        f"{simsar_median_size} x {simsar_median_size}"
+    )
+    print(f"peak sigma:             {peak_sigma} px")
+    print(
+        f"peak prominence:        "
+        f"{peak_prominence_db} dB"
+    )
+    print(f"peak mode (MLI):        {peak_mode}")
+    print(
+        f"SimSAR max jump:        {simsar_max_jump_pixels:g} px/row"
+    )
+    print(
+        f"SimSAR continuity cost: {simsar_continuity_penalty:g} per px"
+    )
+    print(
+        f"minimum model coverage: "
+        f"{min_coverage:.0%}"
+    )
+    print(
+        "ranking basis:          "
+        "filtered MLI peak positions ONLY"
+    )
+    print(
+        f"interaction mode:       {interaction}"
+    )
+    print(
+        f"overview grid:          "
+        f"{overview_grid_rows} x {overview_grid_cols}"
+    )
+
+    if provenance_dir is not None:
+        print(
+            f"provenance directory:   "
+            f"{provenance_dir}"
+        )
+
+    print(
+        "excavation gap rule:    ONLY "
+        "excavate_to_lower/subtract_thickness; "
+        "fill/addition keep the first data section"
+    )
+
+    # ------------------------------------------------------------------
+    # Observed MLI
+    # ------------------------------------------------------------------
+    print(
+        "\n[1/4] Preparing dense observed MLI profiles"
+    )
+
+    raw_mli_dense, filtered_mli_dense, mli_shape = (
+        prepare_mli_dense_profiles(
+            mli_tif,
+            median_size=median_size,
+        )
+    )
+
+    raw_mli_picks_dense = pick_dense_profile_set(
+        raw_mli_dense,
+        peak_sigma=peak_sigma,
+        prominence_db=peak_prominence_db,
+        min_distance_pixels=peak_distance_pixels,
+        peak_mode=peak_mode,
+    )
+
+    filtered_mli_picks_dense = pick_dense_profile_set(
+        filtered_mli_dense,
+        peak_sigma=peak_sigma,
+        prominence_db=peak_prominence_db,
+        min_distance_pixels=peak_distance_pixels,
+        peak_mode=peak_mode,
+    )
+
+    n_filtered_obs = sum(
+        p is not None
+        for p in filtered_mli_picks_dense.values()
+    )
+
+    if n_filtered_obs == 0:
+        raise RuntimeError(
+            "No filtered MLI peaks were detected on any "
+            "inversion row. Try lowering "
+            "--peak-prominence-db or changing --peak-mode."
+        )
+
+    print(
+        f"  filtered MLI valid peaks: "
+        f"{n_filtered_obs}/{len(INVERSION_ROWS)} rows"
+    )
+
+    if n_filtered_obs < len(INVERSION_ROWS):
+        print(
+            "  WARNING: rows without an observed filtered "
+            "peak are attempted and written to CSV, but "
+            "cannot constrain the inversion."
+        )
+
+    observed_df = observed_dense_peak_table(
+        raw_mli_picks_dense,
+        filtered_mli_picks_dense,
+    )
+
+    observed_csv = (
+        output_dir
+        / "observed_dense_peak_positions.csv"
+    )
+    observed_df.to_csv(
+        observed_csv,
+        index=False,
+    )
+
+    filtered_plot_profiles = subset_plot_profiles(
+        filtered_mli_dense
+    )
+    filtered_plot_picks = subset_plot_picks(
+        filtered_mli_picks_dense
+    )
+
+    observed_png = (
+        output_dir
+        / "observed_mli_filtered_profiles.png"
+    )
+
+    plot_observed_mli_profiles(
+        filtered_plot_profiles,
+        filtered_plot_picks,
+        observed_png,
+        mli_name=mli_tif.name,
+    )
+
+    # ------------------------------------------------------------------
+    # Models
+    # ------------------------------------------------------------------
+    print(
+        "\n[2/4] Tracing and scoring SimSAR edges"
+    )
+
+    score_rows: List[Dict[str, object]] = []
+    all_residual_rows: List[
+        Dict[str, object]
+    ] = []
+
+    sim_plot_profiles_by_id: Dict[
+        str, Dict[str, np.ndarray]
+    ] = {}
+    sim_plot_picks_by_id: Dict[
+        str, Dict[str, Optional[PeakPick]]
+    ] = {}
+    sim_dense_picks_by_id: Dict[
+        str, Dict[int, Optional[PeakPick]]
+    ] = {}
+
+    for index, run_id in enumerate(
+        run_ids,
+        start=1,
+    ):
+        simsar_tif = (
+            simsar_dir
+            / simsar_pattern.format(id=run_id)
+        )
+
+        (
+            model_interaction,
+            use_excavation_gap_rule,
+            provenance_path,
+        ) = resolve_model_interaction(
+            run_id,
+            simsar_dir=simsar_dir,
+            interaction=interaction,
+            provenance_dir=provenance_dir,
+            provenance_pattern=provenance_pattern,
+        )
+
+        print(
+            f"  [{index:>4}/{len(run_ids)}] "
+            f"{run_id} [{model_interaction}]: ",
+            end="",
+            flush=True,
+        )
+
+        if not simsar_tif.exists():
+            print("missing sim_sar")
+            score_rows.append({
+                "run_id": run_id,
+                "interaction": model_interaction,
+                "excavation_gap_rule_applied": bool(
+                    use_excavation_gap_rule
+                ),
+                "provenance_json": (
+                    None
+                    if provenance_path is None
+                    else str(provenance_path)
+                ),
+                "status": "missing_file",
+                "n_rows_total": len(INVERSION_ROWS),
+                "n_rows_observed_valid": n_filtered_obs,
+                "n_rows_matched": 0,
+                "coverage": 0.0,
+                "rmse_filtered_m": np.nan,
+                "mae_filtered_m": np.nan,
+                "bias_filtered_m": np.nan,
+                "rmse_raw_m": np.nan,
+                "n_rows_internal_nodata_gap": np.nan,
+            })
+            continue
+
+        try:
+            sim_dense = read_simsar_dense_profiles(
+                simsar_tif,
+                expected_shape=mli_shape,
+                median_size=simsar_median_size,
+            )
+
+            internal_gap_rows = sum(
+                has_internal_nodata_gap(
+                    sim_dense[row],
+                    shadow_start_x=(
+                        SHADOW_START_BY_ROW[row]
+                    ),
+                )
+                for row in INVERSION_ROWS
+            )
+
+            sim_picks_dense = pick_continuous_simsar_edge(
+                sim_dense,
+                peak_sigma=peak_sigma,
+                prominence_db=peak_prominence_db,
+                min_distance_pixels=peak_distance_pixels,
+                respect_internal_nodata_gaps=use_excavation_gap_rule,
+                max_jump_pixels=simsar_max_jump_pixels,
+                continuity_penalty=simsar_continuity_penalty,
+            )
+
+            summary, residuals = score_dense_model(
+                run_id,
+                sim_picks_dense,
+                raw_mli_picks_dense,
+                filtered_mli_picks_dense,
+                min_coverage=min_coverage,
+            )
+
+            summary["interaction"] = (
+                model_interaction
+            )
+            summary[
+                "excavation_gap_rule_applied"
+            ] = bool(use_excavation_gap_rule)
+            summary["provenance_json"] = (
+                None
+                if provenance_path is None
+                else str(provenance_path)
+            )
+            summary[
+                "n_rows_internal_nodata_gap"
+            ] = int(internal_gap_rows)
+
+            score_rows.append(summary)
+            all_residual_rows.extend(residuals)
+
+            if summary["status"] == "ok":
+                sim_plot_profiles_by_id[run_id] = (
+                    subset_plot_profiles(sim_dense)
+                )
+                sim_plot_picks_by_id[run_id] = (
+                    subset_plot_picks(
+                        sim_picks_dense
+                    )
+                )
+                sim_dense_picks_by_id[run_id] = dict(
+                    sim_picks_dense
+                )
+
+                print(
+                    f"dense filtered RMSE "
+                    f"{float(summary['rmse_filtered_m']):.2f} m "
+                    f"({int(summary['n_rows_matched'])}/"
+                    f"{int(summary['n_rows_observed_valid'])} "
+                    f"rows; "
+                    f"{int(summary['n_rows_internal_nodata_gap'])} "
+                    f"rows with internal no-data gaps; "
+                    f"gap-rule="
+                    f"{'ON' if use_excavation_gap_rule else 'OFF'})"
+                )
+            else:
+                print(
+                    f"{summary['status']} "
+                    f"({int(summary['n_rows_matched'])}/"
+                    f"{int(summary['n_rows_observed_valid'])} "
+                    f"rows)"
+                )
+
+        except Exception as exc:
+            print(f"failed: {exc}")
+            score_rows.append({
+                "run_id": run_id,
+                "interaction": model_interaction,
+                "excavation_gap_rule_applied": bool(
+                    use_excavation_gap_rule
+                ),
+                "provenance_json": (
+                    None
+                    if provenance_path is None
+                    else str(provenance_path)
+                ),
+                "status": f"error: {exc}",
+                "n_rows_total": len(INVERSION_ROWS),
+                "n_rows_observed_valid": n_filtered_obs,
+                "n_rows_matched": 0,
+                "coverage": 0.0,
+                "rmse_filtered_m": np.nan,
+                "mae_filtered_m": np.nan,
+                "bias_filtered_m": np.nan,
+                "rmse_raw_m": np.nan,
+                "n_rows_internal_nodata_gap": np.nan,
+            })
+
+    ranking = pd.DataFrame(score_rows)
+    residuals_df = pd.DataFrame(
+        all_residual_rows
+    )
+
+    residuals_csv = (
+        output_dir
+        / "dense_peak_model_residuals.csv"
+    )
+    residuals_df.to_csv(
+        residuals_csv,
+        index=False,
+    )
+
+    valid_mask = (
+        (ranking["status"] == "ok")
+        & np.isfinite(ranking["rmse_filtered_m"])
+    )
+
+    if not np.any(valid_mask):
+        ranking_csv = (
+            output_dir
+            / "peak_model_ranking.csv"
+        )
+        ranking.to_csv(
+            ranking_csv,
+            index=False,
+        )
+        raise RuntimeError(
+            "No model met the dense peak-coverage "
+            "requirement. Partial ranking written to "
+            f"{ranking_csv}. Consider lowering "
+            "--min-coverage if appropriate."
+        )
+
+    ranking["rank_selected"] = np.nan
+    ranking.loc[
+        valid_mask,
+        "rank_selected",
+    ] = ranking.loc[
+        valid_mask,
+        "rmse_filtered_m",
+    ].rank(
+        method="min",
+        ascending=True,
+    )
+
+    ranking = ranking.sort_values(
+        by=["rmse_filtered_m", "run_id"],
+        ascending=[True, True],
+        na_position="last",
+    ).reset_index(drop=True)
+
+    ranking_csv = (
+        output_dir
+        / "peak_model_ranking.csv"
+    )
+    ranking.to_csv(
+        ranking_csv,
+        index=False,
+    )
+
+    valid_ranking = ranking[
+        (ranking["status"] == "ok")
+        & np.isfinite(ranking["rmse_filtered_m"])
+    ].copy()
+
+    top_models = valid_ranking.head(
+        max(1, int(top_n))
+    ).copy()
+
+    # ------------------------------------------------------------------
+    # Plots
+    # ------------------------------------------------------------------
+    print(
+        "\n[3/4] Plotting top models and overview grid"
+    )
+
+    top_png = (
+        output_dir
+        / "top5_peak_profile_comparison.png"
+    )
+    plot_top_models(
+        top_models,
+        sim_plot_profiles_by_id,
+        filtered_plot_profiles,
+        filtered_plot_picks,
+        sim_plot_picks_by_id,
+        top_png,
+        mli_name=mli_tif.name,
+    )
+
+    top_3x5_png = (
+        output_dir
+        / "top5_3x5_image_mli_profile_comparison.png"
+    )
+    plot_top5_image_profile_summary(
+        top_models,
+        simsar_dir,
+        simsar_pattern,
+        mli_tif,
+        mli_shape,
+        sim_plot_profiles_by_id,
+        filtered_plot_profiles,
+        filtered_plot_picks,
+        sim_plot_picks_by_id,
+        filtered_mli_picks_dense,
+        sim_dense_picks_by_id,
+        top_3x5_png,
+    )
+
+    n_overview_models = min(
+        len(valid_ranking),
+        overview_grid_rows * overview_grid_cols - 1,
+    )
+    overview_png = (
+        output_dir
+        / (
+            f"top{n_overview_models}_"
+            f"{overview_grid_rows}x{overview_grid_cols}_"
+            "image_grid.png"
+        )
+    )
+
+    plot_many_model_image_grid(
+        ranking,
+        simsar_dir,
+        simsar_pattern,
+        mli_tif,
+        mli_shape,
+        sim_plot_profiles_by_id,
+        filtered_plot_profiles,
+        filtered_mli_picks_dense,
+        sim_dense_picks_by_id,
+        overview_png,
+        grid_rows=overview_grid_rows,
+        grid_cols=overview_grid_cols,
+    )
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+    print(
+        "\n[4/4] Best-fitting dense models"
+    )
+
+    show_cols = [
+        "rank_selected",
+        "run_id",
+        "rmse_filtered_m",
+        "mae_filtered_m",
+        "bias_filtered_m",
+        "coverage",
+        "n_rows_matched",
+        "n_rows_observed_valid",
+    ]
+
+    print(
+        top_models[show_cols].to_string(
+            index=False
+        )
+    )
+
+    best = top_models.iloc[0]
+
+    print(
+        "\nBEST FITTING MODEL — "
+        "filtered MLI dense peak inversion"
+    )
+    print(f"  P.{best['run_id']}.dem")
+    print(
+        f"  RMSE:      "
+        f"{best['rmse_filtered_m']:.3f} m"
+    )
+    print(
+        f"  MAE:       "
+        f"{best['mae_filtered_m']:.3f} m"
+    )
+    print(
+        f"  bias:      "
+        f"{best['bias_filtered_m']:+.3f} m"
+    )
+    print(
+        f"  coverage:  "
+        f"{best['coverage']:.1%}"
+    )
+    print(
+        f"  rows used: "
+        f"{int(best['n_rows_matched'])}/"
+        f"{int(best['n_rows_observed_valid'])}"
+    )
+
+    print("\nOutputs:")
+    for path in [
+        observed_csv,
+        residuals_csv,
+        ranking_csv,
+        observed_png,
+        top_png,
+        top_3x5_png,
+        overview_png,
+    ]:
+        print(f"  {path}")
+
+    return {
+        "best_run_id": str(best["run_id"]),
+        "best_rmse_filtered_m": float(
+            best["rmse_filtered_m"]
+        ),
+        "ranking": ranking,
+        "residuals": residuals_df,
+        "observed_peaks": observed_df,
+        "ranking_csv": ranking_csv,
+        "residuals_csv": residuals_csv,
+        "top5_plot": top_png,
+        "top5_3x5_plot": top_3x5_png,
+        "overview_grid_plot": overview_png,
+    }
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Rank modified DEM models by filtered-MLI "
+            "post-shadow peak positions over a "
+            "configurable azimuth corridor."
+        )
+    )
+
+    parser.add_argument(
+        "mli_tif",
+        type=Path,
+    )
+    parser.add_argument(
+        "simsar_dir",
+        type=Path,
+    )
+    parser.add_argument("id_start")
+    parser.add_argument("id_end")
+
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path(
+            "peak_model_inversion_dense"
+        ),
+    )
+    parser.add_argument(
+        "--simsar-pattern",
+        default="P.{id}.sim_sar.radar.tif",
+        help="Filename pattern containing {id}.",
+    )
+    parser.add_argument(
+        "--median-size",
+        type=int,
+        default=15,
+    )
+    parser.add_argument(
+        "--simsar-median-size",
+        type=int,
+        default=3,
+        help=(
+            "Odd 2-D median-filter size applied to SimSAR before peak "
+            "picking. Default: 3 (3x3). Use 1 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--peak-sigma",
+        type=float,
+        default=1.5,
+    )
+    parser.add_argument(
+        "--peak-prominence-db",
+        type=float,
+        default=2.0,
+    )
+    parser.add_argument(
+        "--peak-distance-pixels",
+        type=int,
+        default=3,
+    )
+    parser.add_argument(
+        "--peak-mode",
+        choices=("first", "most_prominent"),
+        default="first",
+    )
+    parser.add_argument(
+        "--simsar-max-jump-pixels",
+        type=float,
+        default=4.0,
+        help=(
+            "Maximum SimSAR peak movement per azimuth row. "
+            "Larger jumps are rejected. Default: 4."
+        ),
+    )
+    parser.add_argument(
+        "--simsar-continuity-penalty",
+        type=float,
+        default=0.25,
+        help=(
+            "Cost per pixel of SimSAR row-to-row peak movement. "
+            "Default: 0.25."
+        ),
+    )
+    parser.add_argument(
+        "--min-coverage",
+        type=float,
+        default=1.0,
+        help=(
+            "Fraction of filtered-MLI-valid rows on "
+            "which a model must also produce a peak "
+            "to be ranked. Default 1.0 (100%%)."
+        ),
+    )
+    parser.add_argument(
+        "--azimuth-min",
+        type=int,
+        default=DEFAULT_INVERSION_ROW_MIN,
+        help=(
+            "First azimuth row used in inversion. "
+            f"Default: {DEFAULT_INVERSION_ROW_MIN}. "
+            "Can extend below profile C."
+        ),
+    )
+    parser.add_argument(
+        "--azimuth-max",
+        type=int,
+        default=DEFAULT_INVERSION_ROW_MAX,
+        help=(
+            "Last azimuth row used in inversion. "
+            f"Default: {DEFAULT_INVERSION_ROW_MAX}. "
+            "Can extend above profile A."
+        ),
+    )
+    parser.add_argument(
+        "--interaction",
+        choices=(
+            "auto",
+            "excavate_to_lower",
+            "subtract_thickness",
+            "fill_to_upper",
+            "add_thickness",
+        ),
+        default="auto",
+        help=(
+            "Interaction handling. 'auto' reads "
+            "each model run JSON; otherwise force "
+            "one interaction for all requested IDs."
+        ),
+    )
+    parser.add_argument(
+        "--provenance-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory containing run JSON files "
+            "(normally the synthetic DEM directory)."
+        ),
+    )
+    parser.add_argument(
+        "--provenance-pattern",
+        default="{id}.json",
+        help=(
+            "Run-JSON filename pattern containing "
+            "{id}. Default: {id}.json"
+        ),
+    )
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=5,
+    )
+    parser.add_argument(
+        "--overview-grid-rows",
+        type=int,
+        default=8,
+        help=(
+            "Rows in the many-model overview grid "
+            "(default: 8)."
+        ),
+    )
+    parser.add_argument(
+        "--overview-grid-cols",
+        type=int,
+        default=8,
+        help=(
+            "Columns in the many-model overview grid "
+            "(default: 8)."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    if "{id}" not in args.simsar_pattern:
+        parser.error(
+            "--simsar-pattern must contain '{id}'."
+        )
+    if "{id}" not in args.provenance_pattern:
+        parser.error(
+            "--provenance-pattern must contain '{id}'."
+        )
+
+    run_ids = build_run_ids(
+        args.id_start,
+        args.id_end,
+    )
+
+    run_peak_inversion(
+        mli_tif=args.mli_tif,
+        simsar_dir=args.simsar_dir,
+        run_ids=run_ids,
+        output_dir=args.output_dir,
+        simsar_pattern=args.simsar_pattern,
+        median_size=args.median_size,
+        simsar_median_size=args.simsar_median_size,
+        peak_sigma=args.peak_sigma,
+        peak_prominence_db=args.peak_prominence_db,
+        peak_distance_pixels=(
+            args.peak_distance_pixels
+        ),
+        peak_mode=args.peak_mode,
+        min_coverage=args.min_coverage,
+        top_n=args.top_n,
+        azimuth_min=args.azimuth_min,
+        azimuth_max=args.azimuth_max,
+        interaction=args.interaction,
+        provenance_dir=args.provenance_dir,
+        provenance_pattern=args.provenance_pattern,
+        overview_grid_rows=args.overview_grid_rows,
+        overview_grid_cols=args.overview_grid_cols,
+        simsar_max_jump_pixels=args.simsar_max_jump_pixels,
+        simsar_continuity_penalty=args.simsar_continuity_penalty,
+    )
+
+
+if __name__ == "__main__":
+    main()
