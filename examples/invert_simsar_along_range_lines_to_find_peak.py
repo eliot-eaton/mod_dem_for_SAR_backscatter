@@ -88,10 +88,10 @@ from scipy.signal import find_peaks
 # =============================================================================
 
 PROFILE_X1 = 775
-PROFILE_X2 = 900
+PROFILE_X2 = 950
 
 PLOT_PROFILE_LABELS = ("A", "B", "C")
-PLOT_PROFILE_ROWS = (2030, 2010, 1990)
+PLOT_PROFILE_ROWS = (2050, 2010, 1990)
 PLOT_SHADOW_START_XS = (812, 823, 826)
 
 DEFAULT_INVERSION_ROW_MIN = min(PLOT_PROFILE_ROWS)
@@ -104,7 +104,7 @@ INVERSION_ROWS = tuple(range(INVERSION_ROW_MIN, INVERSION_ROW_MAX + 1))
 RANGE_PIXEL_SPACING_M = 2.728212
 
 IMAGE_X1 = 750
-IMAGE_X2 = 930
+IMAGE_X2 = 980
 DEFAULT_IMAGE_Y1 = 1960
 DEFAULT_IMAGE_Y2 = 2060
 IMAGE_Y1 = DEFAULT_IMAGE_Y1
@@ -945,13 +945,13 @@ def plot_observed_mli_profiles(
     for ax, label, shadow_start in zip(
         axes, PLOT_PROFILE_LABELS, PLOT_SHADOW_START_XS
     ):
-        ax.plot(
-            x,
-            raw_profiles[label],
-            linewidth=0.9,
-            alpha=0.55,
-            label="MLI raw",
-        )
+        # ax.plot(
+        #     x,
+        #     raw_profiles[label],
+        #     linewidth=0.9,
+        #     alpha=0.55,
+        #     label="MLI raw",
+        # )
         ax.plot(
             x,
             filtered_profiles[label],
@@ -969,14 +969,14 @@ def plot_observed_mli_profiles(
             label="Shadow-search start" if label == "A" else None,
         )
 
-        if raw_pick is not None:
-            ax.axvline(
-                raw_pick.x_pixel,
-                linestyle="--",
-                linewidth=0.9,
-                alpha=0.6,
-                label="Raw peak" if label == "A" else None,
-            )
+        # if raw_pick is not None:
+        #     ax.axvline(
+        #         raw_pick.x_pixel,
+        #         linestyle="--",
+        #         linewidth=0.9,
+        #         alpha=0.6,
+        #         label="Raw peak" if label == "A" else None,
+        #     )
         if filt_pick is not None:
             ax.axvline(
                 filt_pick.x_pixel,
