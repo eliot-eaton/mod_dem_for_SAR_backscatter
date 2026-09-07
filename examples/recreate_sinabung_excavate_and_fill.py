@@ -96,7 +96,7 @@ EXCAVATE_Z_VALUES = [
 
 # Semi-axes (a, b, c), metres.
 EXCAVATE_SEMI_AXES_VALUES = [
-    (100.0, 120.0, 100.0),
+    (100.0, 150.0, 100.0),
 ]
 
 # yaw, pitch, roll, degrees.
@@ -113,22 +113,39 @@ EXCAVATE_INTERACTION = "excavate_to_lower"
 # This geometry is applied AFTER the excavation to the already modified DEM.
 
 FILL_X_VALUES = [
-    432510.0,
+    432500.0,
+    432525.0,
+    432550.0,
+    432575.0,
 ]
 
 FILL_Y_VALUES = [
-    350435.0,
+    350450.0,
+    350475.0,
+    350500.0,
+    350525.0,
 ]
 
 FILL_Z_VALUES = [
     2300.0,
+    2325.0,
+    2375.0,
 ]
 
 # Semi-axes (a, b, c), metres.
 FILL_SEMI_AXES_VALUES = [
     (130.0, 130.0, 75.0),
     (110.0, 110.0, 75.0),
+    (120.0, 120.0, 75.0),
     (100.0, 100.0, 75.0),
+    (130.0, 130.0, 100.0),
+    (110.0, 110.0, 100.0),
+    (120.0, 120.0, 100.0),
+    (100.0, 100.0, 100.0),
+    (130.0, 130.0, 125.0),
+    (110.0, 110.0, 125.0),
+    (120.0, 120.0, 125.0),
+    (100.0, 100.0, 125.0),
 ]
 
 # yaw, pitch, roll, degrees.
