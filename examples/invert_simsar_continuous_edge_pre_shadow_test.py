@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Invert SimSAR models against an observed MLI using post-shadow peak positions.
+Test inversion using the established continuous post-shadow edge plus a pre-shadow diagnostic edge.
 
 The observed MLI is median filtered before its peaks are picked. SimSAR is
 median filtered separately (3 x 3 by default), then all plausible post-shadow
@@ -13,7 +13,7 @@ For excavation models, the search uses the first finite data section after the
 first internal shadow gap. A bright return at the first valid pixel after that
 shadow is allowed as a peak candidate.
 
-Ranking uses only the filtered MLI peak positions. Raw MLI values are retained
+Primary ranking still uses only the established filtered-MLI post-shadow peak positions. Raw MLI values are retained
 for CSV diagnostics but are never plotted.
 """
 
@@ -61,11 +61,11 @@ DEFAULT_IMAGE_Y1 = 1960
 DEFAULT_IMAGE_Y2 = 2060
 IMAGE_Y1 = DEFAULT_IMAGE_Y1
 IMAGE_Y2 = DEFAULT_IMAGE_Y2
-IMAGE_AZIMUTH_PAD = 50
+IMAGE_AZIMUTH_PAD = 150
 
 DISPLAY_VMIN_DB = -30.0
 DISPLAY_VMAX_DB = 0.0
-SIMSAR_NODATA_DB = -30.0
+SIMSAR_NODATA_DB = -40.0
 
 
 @dataclass(frozen=True)
@@ -766,6 +766,216 @@ def pick_continuous_simsar_edge(
     best_path = min(states, key=lambda state: state[0])[3]
     return {row: best_path.get(row) for row in rows}
 
+
+
+def find_pre_shadow_candidates(
+    profile_db: np.ndarray,
+    *,
+    shadow_start_x: float,
+    peak_sigma: float,
+    prominence_db: float,
+    min_distance_pixels: int,
+    shadow_threshold_db: float = -25.0,
+    trough_half_width_pixels: int = 20,
+    search_back_pixels: int = 30,
+) -> List[PeakPick]:
+    """Find bright peaks immediately before a genuine shadow trough.
+
+    A pre-shadow pick is attempted only when the profile contains convincing
+    shadow evidence near ``shadow_start_x``: either a finite value at or below
+    ``shadow_threshold_db`` or a no-data interval.  The search then looks
+    backward from the first/deepest trough and returns plausible bright peaks,
+    ordered from nearest to the trough to furthest away.
+    """
+    x = np.arange(PROFILE_X1, PROFILE_X2 + 1, dtype=float)
+    y = np.asarray(profile_db, dtype=float)
+    if y.size != x.size:
+        raise ValueError(
+            f"Profile has {y.size} samples; expected {x.size}."
+        )
+
+    half = max(1, int(trough_half_width_pixels))
+    lo = float(shadow_start_x) - half
+    hi = float(shadow_start_x) + half
+    window_idx = np.flatnonzero((x >= lo) & (x <= hi))
+    if window_idx.size == 0:
+        return []
+
+    yw = y[window_idx]
+    finite = np.isfinite(yw)
+    low = finite & (yw <= float(shadow_threshold_db))
+    nodata = ~finite
+
+    # No convincing shadow -> deliberately do not create a pre-shadow pick.
+    if not np.any(low) and not np.any(nodata):
+        return []
+
+    # Prefer a real low-amplitude trough when available. For a no-data shadow,
+    # use the first no-data pixel as the shadow boundary.
+    if np.any(low):
+        low_local = np.flatnonzero(low)
+        trough_local = int(low_local[np.argmin(yw[low_local])])
+    else:
+        trough_local = int(np.flatnonzero(nodata)[0])
+
+    trough_idx = int(window_idx[trough_local])
+    start_idx = max(0, trough_idx - max(3, int(search_back_pixels)))
+    if trough_idx - start_idx < 3:
+        return []
+
+    xs = x[start_idx:trough_idx]
+    ys = y[start_idx:trough_idx]
+    finite_search = np.isfinite(ys)
+    if finite_search.sum() < 3:
+        return []
+
+    # Keep only the final finite run before the trough. This avoids selecting a
+    # peak on the far side of an earlier no-data gap.
+    runs = _finite_runs(finite_search)
+    if not runs:
+        return []
+    a, b = runs[-1]
+    xs = xs[a:b]
+    ys = ys[a:b]
+    if ys.size < 3:
+        return []
+
+    if peak_sigma > 0:
+        smooth = gaussian_filter1d(ys, sigma=peak_sigma, mode="nearest")
+    else:
+        smooth = ys
+
+    peaks, props = find_peaks(
+        smooth,
+        prominence=prominence_db,
+        distance=max(1, int(min_distance_pixels)),
+    )
+
+    candidates = [
+        PeakPick(
+            x_pixel=float(xs[int(idx)]),
+            intensity_db=float(smooth[int(idx)]),
+            prominence_db=float(props["prominences"][i]),
+        )
+        for i, idx in enumerate(peaks)
+    ]
+
+    # A bright return can sit directly on the last valid pixel before shadow.
+    # scipy cannot call an array boundary a peak, so add that boundary when the
+    # signal rises into it from the left.
+    if smooth.size >= 2 and smooth[-1] > smooth[-2]:
+        window = max(0, smooth.size - max(3, 1 + 2 * max(1, int(min_distance_pixels))))
+        left_min = float(np.min(smooth[window:-1])) if smooth.size - window > 1 else float(smooth[-2])
+        candidates.append(
+            PeakPick(
+                x_pixel=float(xs[-1]),
+                intensity_db=float(smooth[-1]),
+                prominence_db=max(0.0, float(smooth[-1]) - left_min),
+            )
+        )
+
+    # Nearest-to-trough is the natural first choice for this edge.
+    candidates.sort(key=lambda p: p.x_pixel, reverse=True)
+    return candidates
+
+
+def pick_continuous_pre_shadow_edge(
+    profiles_db: Mapping[int, np.ndarray],
+    *,
+    peak_sigma: float,
+    prominence_db: float,
+    min_distance_pixels: int,
+    shadow_threshold_db: float = -25.0,
+    max_jump_pixels: float = 4.0,
+    continuity_penalty: float = 0.25,
+) -> Dict[int, Optional[PeakPick]]:
+    """Trace a continuous pre-shadow bright edge without affecting post picks."""
+    rows = list(INVERSION_ROWS)
+    candidates_by_row = {
+        row: find_pre_shadow_candidates(
+            profiles_db[row],
+            shadow_start_x=SHADOW_START_BY_ROW[row],
+            peak_sigma=peak_sigma,
+            prominence_db=prominence_db,
+            min_distance_pixels=min_distance_pixels,
+            shadow_threshold_db=shadow_threshold_db,
+        )
+        for row in rows
+    }
+
+    missing_penalty = 1.5
+    later_candidate_penalty = 0.35
+    states = [(0.0, None, None, {})]
+
+    for row in rows:
+        next_states = []
+        for cost, last_x, last_row, picks in states:
+            skipped = dict(picks)
+            skipped[row] = None
+            next_states.append((cost + missing_penalty, last_x, last_row, skipped))
+
+            for rank, peak in enumerate(candidates_by_row[row]):
+                jump_cost = 0.0
+                if last_x is not None and last_row is not None:
+                    row_gap = max(1, row - last_row)
+                    jump = abs(peak.x_pixel - last_x)
+                    if jump > max_jump_pixels * row_gap:
+                        continue
+                    jump_cost = continuity_penalty * jump
+
+                chosen = dict(picks)
+                chosen[row] = peak
+                next_states.append((
+                    cost + jump_cost + later_candidate_penalty * rank,
+                    peak.x_pixel,
+                    row,
+                    chosen,
+                ))
+
+        best = {}
+        for state in next_states:
+            key = (state[1], state[2])
+            if key not in best or state[0] < best[key][0]:
+                best[key] = state
+        states = list(best.values())
+
+    if not states:
+        return {row: None for row in rows}
+    best_path = min(states, key=lambda state: state[0])[3]
+    return {row: best_path.get(row) for row in rows}
+
+
+def score_pre_shadow_edge(
+    sim_picks: Mapping[int, Optional[PeakPick]],
+    mli_picks: Mapping[int, Optional[PeakPick]],
+) -> Dict[str, float]:
+    """Return a separate pre-shadow score; it does not affect primary ranking."""
+    errors = []
+    n_obs = 0
+    matched = 0
+    for row in INVERSION_ROWS:
+        obs = mli_picks.get(row)
+        sim = sim_picks.get(row)
+        if obs is None:
+            continue
+        n_obs += 1
+        if sim is None:
+            continue
+        matched += 1
+        errors.append((sim.x_pixel - obs.x_pixel) * RANGE_PIXEL_SPACING_M)
+
+    arr = np.asarray(errors, dtype=float)
+    rmse_pre = float(np.sqrt(np.mean(arr ** 2))) if arr.size else np.nan
+    mae_pre = float(np.mean(np.abs(arr))) if arr.size else np.nan
+    coverage_pre = matched / n_obs if n_obs else 0.0
+    return {
+        "rmse_pre_shadow_m": rmse_pre,
+        "mae_pre_shadow_m": mae_pre,
+        "pre_shadow_coverage": coverage_pre,
+        "n_pre_shadow_observed_valid": n_obs,
+        "n_pre_shadow_matched": matched,
+    }
+
 def pick_dense_profile_set(
     profiles_db: Mapping[int, np.ndarray],
     *,
@@ -1295,6 +1505,8 @@ def plot_top5_image_profile_summary(
     sim_picks_dense_by_id: Mapping[
         str, Mapping[int, Optional[PeakPick]]
     ],
+    filtered_mli_pre_picks_dense: Mapping[int, Optional[PeakPick]],
+    sim_pre_picks_dense_by_id: Mapping[str, Mapping[int, Optional[PeakPick]]],
     output_png: Path,
 ) -> None:
     """3 x 5 top-model summary with image and A/B/C profile panels."""
@@ -1331,6 +1543,9 @@ def plot_top5_image_profile_summary(
     mli_edge_x, mli_edge_y = _dense_edge_arrays(
         filtered_mli_picks_dense
     )
+    mli_pre_x, mli_pre_y = _dense_edge_arrays(
+        filtered_mli_pre_picks_dense
+    )
 
     for col, (_, model) in enumerate(models.iterrows()):
         run_id = str(model["run_id"])
@@ -1358,6 +1573,9 @@ def plot_top5_image_profile_summary(
 
         sim_edge_x, sim_edge_y = _dense_edge_arrays(
             sim_picks_dense_by_id[run_id]
+        )
+        sim_pre_x, sim_pre_y = _dense_edge_arrays(
+            sim_pre_picks_dense_by_id.get(run_id, {})
         )
 
         # Top: SimSAR image.
@@ -1398,6 +1616,20 @@ def plot_top5_image_profile_summary(
                 label="Filtered MLI picked edge",
                 color="blue",
                 zorder=7,
+            )
+
+        if sim_pre_x.size:
+            ax.scatter(
+                sim_pre_x, sim_pre_y,
+                s=13, marker="o", facecolors="none",
+                edgecolors="magenta", linewidths=0.8, zorder=9,
+                label="SimSAR pre-shadow pick",
+            )
+        if mli_pre_x.size:
+            ax.scatter(
+                mli_pre_x, mli_pre_y,
+                s=10, marker="x", color="cyan", linewidths=0.8, zorder=9,
+                label="MLI pre-shadow pick",
             )
 
         for label, row_y in zip(
@@ -1477,6 +1709,20 @@ def plot_top5_image_profile_summary(
                 zorder=7,
             )
 
+        if sim_pre_x.size:
+            ax.scatter(
+                sim_pre_x, sim_pre_y,
+                s=13, marker="o", facecolors="none",
+                edgecolors="magenta", linewidths=0.8, zorder=9,
+                label="SimSAR pre-shadow pick",
+            )
+        if mli_pre_x.size:
+            ax.scatter(
+                mli_pre_x, mli_pre_y,
+                s=10, marker="x", color="cyan", linewidths=0.8, zorder=9,
+                label="MLI pre-shadow pick",
+            )
+
         for label, row_y in zip(
             PLOT_PROFILE_LABELS,
             PLOT_PROFILE_ROWS,
@@ -1529,6 +1775,9 @@ def plot_top5_image_profile_summary(
             )
             filt_pick = filtered_mli_picks[label]
             sim_pick = sim_picks[label]
+            dense_row = dict(zip(PLOT_PROFILE_LABELS, PLOT_PROFILE_ROWS))[label]
+            filt_pre_pick = filtered_mli_pre_picks_dense.get(dense_row)
+            sim_pre_pick = sim_pre_picks_dense_by_id.get(run_id, {}).get(dense_row)
 
             ax.plot(
                 x,
@@ -1569,6 +1818,21 @@ def plot_top5_image_profile_summary(
                         edgecolors=color,
                         linewidths=1.2,
                         zorder=7,
+                    )
+            if filt_pre_pick is not None:
+                yv = _profile_value_at_pick(filt, filt_pre_pick)
+                if np.isfinite(yv):
+                    ax.scatter(
+                        filt_pre_pick.x_pixel, yv, s=34, marker="x",
+                        color="cyan", linewidths=1.2, zorder=8,
+                    )
+            if sim_pre_pick is not None:
+                yv = _profile_value_at_pick(sim, sim_pre_pick)
+                if np.isfinite(yv):
+                    ax.scatter(
+                        sim_pre_pick.x_pixel, yv, s=38, marker="o",
+                        facecolors="none", edgecolors="magenta",
+                        linewidths=1.2, zorder=8,
                     )
 
             if filt_pick is not None and sim_pick is not None:
@@ -1634,6 +1898,15 @@ def plot_top5_image_profile_summary(
             linestyle="None",
             markerfacecolor="none",
             label="SimSAR peak (A/B/C)",
+        ),
+        Line2D(
+            [0], [0], marker="x", linestyle="None", color="cyan",
+            label="Filtered MLI pre-shadow pick",
+        ),
+        Line2D(
+            [0], [0], marker="o", linestyle="None",
+            markerfacecolor="none", markeredgecolor="magenta",
+            label="SimSAR pre-shadow pick",
         ),
     ]
     fig.legend(
@@ -1992,6 +2265,8 @@ def run_peak_inversion(
     overview_grid_cols: int = 8,
     simsar_max_jump_pixels: float = 4.0,
     simsar_continuity_penalty: float = 0.25,
+    pre_shadow_threshold_db: float = -25.0,
+    pre_shadow_prominence_db: float = 3.0,
 ) -> Dict[str, object]:
     _configure_inversion_geometry(
         azimuth_min,
@@ -2092,6 +2367,8 @@ def run_peak_inversion(
     print(
         f"SimSAR continuity cost: {simsar_continuity_penalty:g} per px"
     )
+    print(f"pre-shadow threshold:   {pre_shadow_threshold_db:g} dB")
+    print(f"pre-shadow prominence:  {pre_shadow_prominence_db:g} dB")
     print(
         f"minimum model coverage: "
         f"{min_coverage:.0%}"
@@ -2148,6 +2425,16 @@ def run_peak_inversion(
         prominence_db=peak_prominence_db,
         min_distance_pixels=peak_distance_pixels,
         peak_mode=peak_mode,
+    )
+
+    filtered_mli_pre_picks_dense = pick_continuous_pre_shadow_edge(
+        filtered_mli_dense,
+        peak_sigma=peak_sigma,
+        prominence_db=pre_shadow_prominence_db,
+        min_distance_pixels=peak_distance_pixels,
+        shadow_threshold_db=pre_shadow_threshold_db,
+        max_jump_pixels=simsar_max_jump_pixels,
+        continuity_penalty=simsar_continuity_penalty,
     )
 
     n_filtered_obs = sum(
@@ -2226,6 +2513,9 @@ def run_peak_inversion(
         str, Dict[str, Optional[PeakPick]]
     ] = {}
     sim_dense_picks_by_id: Dict[
+        str, Dict[int, Optional[PeakPick]]
+    ] = {}
+    sim_pre_dense_picks_by_id: Dict[
         str, Dict[int, Optional[PeakPick]]
     ] = {}
 
@@ -2310,12 +2600,31 @@ def run_peak_inversion(
                 continuity_penalty=simsar_continuity_penalty,
             )
 
+            # Separate pre-shadow diagnostic. This does not alter the established
+            # post-shadow picker above or the primary ranking.
+            sim_pre_picks_dense = pick_continuous_pre_shadow_edge(
+                sim_dense,
+                peak_sigma=peak_sigma,
+                prominence_db=pre_shadow_prominence_db,
+                min_distance_pixels=peak_distance_pixels,
+                shadow_threshold_db=pre_shadow_threshold_db,
+                max_jump_pixels=simsar_max_jump_pixels,
+                continuity_penalty=simsar_continuity_penalty,
+            )
+
             summary, residuals = score_dense_model(
                 run_id,
                 sim_picks_dense,
                 raw_mli_picks_dense,
                 filtered_mli_picks_dense,
                 min_coverage=min_coverage,
+            )
+
+            summary.update(
+                score_pre_shadow_edge(
+                    sim_pre_picks_dense,
+                    filtered_mli_pre_picks_dense,
+                )
             )
 
             summary["interaction"] = (
@@ -2347,6 +2656,9 @@ def run_peak_inversion(
                 )
                 sim_dense_picks_by_id[run_id] = dict(
                     sim_picks_dense
+                )
+                sim_pre_dense_picks_by_id[run_id] = dict(
+                    sim_pre_picks_dense
                 )
 
                 print(
@@ -2501,6 +2813,8 @@ def run_peak_inversion(
         sim_plot_picks_by_id,
         filtered_mli_picks_dense,
         sim_dense_picks_by_id,
+        filtered_mli_pre_picks_dense,
+        sim_pre_dense_picks_by_id,
         top_3x5_png,
     )
 
@@ -2548,6 +2862,8 @@ def run_peak_inversion(
         "coverage",
         "n_rows_matched",
         "n_rows_observed_valid",
+        "rmse_pre_shadow_m",
+        "pre_shadow_coverage",
     ]
 
     print(
@@ -2702,6 +3018,21 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--pre-shadow-threshold-db",
+        type=float,
+        default=-25.0,
+        help=(
+            "Only attempt a pre-shadow pick when the profile reaches this "
+            "amplitude or lower near the expected shadow. Default: -25 dB."
+        ),
+    )
+    parser.add_argument(
+        "--pre-shadow-prominence-db",
+        type=float,
+        default=3.0,
+        help="Prominence threshold for the pre-shadow bright peak. Default: 3 dB.",
+    )
+    parser.add_argument(
         "--min-coverage",
         type=float,
         default=1.0,
@@ -2829,6 +3160,8 @@ def main() -> None:
         overview_grid_cols=args.overview_grid_cols,
         simsar_max_jump_pixels=args.simsar_max_jump_pixels,
         simsar_continuity_penalty=args.simsar_continuity_penalty,
+        pre_shadow_threshold_db=args.pre_shadow_threshold_db,
+        pre_shadow_prominence_db=args.pre_shadow_prominence_db,
     )
 
 
