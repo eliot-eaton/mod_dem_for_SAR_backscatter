@@ -39,7 +39,7 @@ from scipy.signal import find_peaks
 # GEOMETRY
 # =============================================================================
 
-PROFILE_X1 = 775
+PROFILE_X1 = 810
 PROFILE_X2 = 900
 
 PLOT_PROFILE_LABELS = ("A", "B", "C")
