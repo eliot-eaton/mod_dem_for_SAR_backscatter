@@ -13,6 +13,10 @@ and scoring, but allows different prominence thresholds for:
 
 Place this file in the same `examples/` directory as
 `invert_simsar_continuous_edge.py`, then run this file instead of the original.
+nohup python ../mod_dem_for_SAR_backscatter/examples/invert_simsar_continuous_edge_shadow_floor.py     ./mli_tifs/2020-2021/20200109.mli.tif     ./sim_sar_crater/     1 6500     --median-size 15     --mli-peak-prominence-db 5     --simsar-peak-prominence-db 2     --simsar-median-size 1     --peak-sigma 0.5     --peak-distance-pixels 2     --simsar-shadow-floor-db -30     --simsar-shadow-pad-pixels 3     --min-coverage 0.8     --azimuth-min 1965     --azimuth-max 2080     --interaction excavate_to_lower     --provenance-dir ./mod_dem_crater/synthetic_sweep/     --simsar-continuity-penalty 0.15     --simsar-max-jump-pixels 6
+
+nohup python ../mod_dem_for_SAR_backscatter/examples/invert_simsar_continuous_edge_shadow_floor.py     ./mli_tifs/2020-2021/20201101.mli.tif     ./sim_sar_dome_sweep/     1 500     --median-size 15     --mli-peak-prominence-db 5     --simsar-peak-prominence-db 2     --simsar-median-size 1     --peak-sigma 0.5     --peak-distance-pixels 2     --simsar-shadow-floor-db -30     --simsar-shadow-pad-pixels 3     --min-coverage 0.8     --azimuth-min 1965     --azimuth-max 2080         --provenance-dir ./mod_dem_Dome/synthetic_sweep_excavate_fill/     --simsar-continuity-penalty 0.15     --simsar-max-jump-pixels 6
+
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ import argparse
 import importlib.util
 from pathlib import Path
 import sys
-
+import re
 
 def load_base_module():
     """
@@ -52,7 +56,81 @@ def load_base_module():
     spec.loader.exec_module(module)
     return module
 
+def discover_run_ids(
+    simsar_dir: Path,
+    simsar_pattern: str,
+    id_start: str,
+    id_end: str,
+) -> list[str]:
+    """
+    Find SimSAR files on disk and return their IDs exactly as written
+    in the filenames.
 
+    Leading zeros are ignored when comparing IDs, so IDs such as
+    1, 01, 001, and 0001 are all treated as numeric ID 1.
+    """
+    start_i = int(id_start)
+    end_i = int(id_end)
+
+    if end_i < start_i:
+        raise ValueError("id_end must be >= id_start.")
+
+    # Turn:
+    #   P.{id}.sim_sar.radar.tif
+    #
+    # into a regex that captures any number of digits for {id}.
+    pattern_regex = re.escape(simsar_pattern)
+    pattern_regex = pattern_regex.replace(
+        re.escape("{id}"),
+        r"(?P<id>\d+)",
+    )
+    regex = re.compile(rf"^{pattern_regex}$")
+
+    found: dict[int, str] = {}
+
+    for path in Path(simsar_dir).iterdir():
+        if not path.is_file():
+            continue
+
+        match = regex.match(path.name)
+        if match is None:
+            continue
+
+        raw_id = match.group("id")
+        numeric_id = int(raw_id)
+
+        if not (start_i <= numeric_id <= end_i):
+            continue
+
+        # Protect against ambiguous cases such as having both
+        # P.1.sim_sar.radar.tif and P.0001.sim_sar.radar.tif.
+        if numeric_id in found:
+            raise ValueError(
+                f"Multiple files represent numeric ID {numeric_id}: "
+                f"{found[numeric_id]!r} and {raw_id!r}"
+            )
+
+        # Keep the ID exactly as it appears in the filename.
+        found[numeric_id] = raw_id
+
+    if not found:
+        raise FileNotFoundError(
+            f"No SimSAR files matching {simsar_pattern!r} "
+            f"were found in {simsar_dir} for IDs "
+            f"{start_i} to {end_i}."
+        )
+
+    run_ids = [
+        found[numeric_id]
+        for numeric_id in sorted(found)
+    ]
+
+    print(
+        f"Found {len(run_ids)} SimSAR files for numeric IDs "
+        f"{start_i}–{end_i}."
+    )
+
+    return run_ids
 def main() -> None:
     base = load_base_module()
 
@@ -306,7 +384,9 @@ def main() -> None:
         pick_continuous_simsar_edge_with_sim_prominence
     )
 
-    run_ids = base.build_run_ids(
+    run_ids = discover_run_ids(
+        args.simsar_dir,
+        args.simsar_pattern,
         args.id_start,
         args.id_end,
     )

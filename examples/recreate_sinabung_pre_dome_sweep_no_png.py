@@ -40,59 +40,94 @@ def get_next_run_id(output_dir: Path) -> int:
 # USER SETTINGS
 # =============================================================================
 
-DATA = Path("mod_dem_crater_sweep")
+# DATA = Path("mod_dem_crater_sweep")
 
-DEM = DATA / "P.dem"
-PAR = DATA / "P.dem_par"
+# DEM = DATA / "P.dem"
+# PAR = DATA / "P.dem_par"
 
-OUT = DATA / "synthetic_sweep"
-OUT.mkdir(parents=True, exist_ok=True)
+# OUT = DATA / "synthetic_sweep"
+# OUT.mkdir(parents=True, exist_ok=True)
 
 
-# -----------------------------------------------------------------------------
-# Geometry sweep
-# -----------------------------------------------------------------------------
-
+# # -----------------------------------------------------------------------------
+# # Geometry sweep
+# # -----------------------------------------------------------------------------
 
 X_VALUES = [
-    432480.0,
-    432500.0,
-    432520.0,
-    432540.0,
-
-
+    432530.0,
+    432550.0,
+    432570.0,
 ]
 
 Y_VALUES = [
-    350440.0,
-
-    350420.0,
-
+    350340.0,   # extends south of current range
+    350370.0,
     350400.0,
-
-    350380,
-
-    350360,
-
-
-    
+    350430.0,   # transition toward current good region
 ]
 
 Z_VALUES = [
-    2360,
-    2340,
-    2320,
-    2300,
-    2280,
-  
+    2330.0,
+    2350.0,
+    2370.0,     # extends upward beyond current tested maximum
 ]
-# Semi-axes (a, b, c), metres
-SEMI_AXES_VALUES = []
 
-for a in np.arange(60, 160, 20):
-    for b in np.arange(100, 160, 20):
-        for c in np.arange(60, 160, 20):
-            SEMI_AXES_VALUES.append((a, b, c))
+SEMI_AXES_VALUES = [
+    (80.0,  120.0,  80.0),
+    (80.0,  160.0, 120.0),
+
+    (100.0, 120.0,  80.0),
+    (100.0, 160.0, 100.0),
+    (100.0, 180.0, 140.0),
+
+    (120.0, 140.0,  80.0),
+    (120.0, 180.0, 140.0),
+
+    (140.0, 120.0,  60.0),
+]
+
+ROTATION_VALUES = [
+    (0.0, 0.0, 0.0)
+]
+# X_VALUES = [
+#     432480.0,
+#     432500.0,
+#     432520.0,
+#     432540.0,
+
+
+# ]
+
+# Y_VALUES = [
+#     350440.0,
+
+#     350420.0,
+
+#     350400.0,
+
+#     350380,
+
+#     350360,
+
+
+    
+# ]
+
+# Z_VALUES = [
+#     2360,
+#     2340,
+#     2320,
+#     2300,
+#     2280,
+  
+# ]
+# Semi-axes (a, b, c), metres
+# SEMI_AXES_VALUES = []
+
+# for a in np.arange(60, 160, 20):
+#     for b in np.arange(100, 160, 20):
+#         for c in np.arange(60, 160, 20):
+#             SEMI_AXES_VALUES.append((a, b, c))
 
 # yaw, pitch, roll in degrees
 ROTATION_VALUES = [
