@@ -23,7 +23,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
-
+import re 
 
 def load_base_module():
     """
@@ -54,6 +54,81 @@ def load_base_module():
     spec.loader.exec_module(module)
     return module
 
+def discover_run_ids(
+    simsar_dir: Path,
+    simsar_pattern: str,
+    id_start: str,
+    id_end: str,
+) -> list[str]:
+    """
+    Find SimSAR files on disk and return their IDs exactly as written
+    in the filenames.
+
+    Leading zeros are ignored when comparing IDs, so IDs such as
+    1, 01, 001, and 0001 are all treated as numeric ID 1.
+    """
+    start_i = int(id_start)
+    end_i = int(id_end)
+
+    if end_i < start_i:
+        raise ValueError("id_end must be >= id_start.")
+
+    # Turn:
+    #   P.{id}.sim_sar.radar.tif
+    #
+    # into a regex that captures any number of digits for {id}.
+    pattern_regex = re.escape(simsar_pattern)
+    pattern_regex = pattern_regex.replace(
+        re.escape("{id}"),
+        r"(?P<id>\d+)",
+    )
+    regex = re.compile(rf"^{pattern_regex}$")
+
+    found: dict[int, str] = {}
+
+    for path in Path(simsar_dir).iterdir():
+        if not path.is_file():
+            continue
+
+        match = regex.match(path.name)
+        if match is None:
+            continue
+
+        raw_id = match.group("id")
+        numeric_id = int(raw_id)
+
+        if not (start_i <= numeric_id <= end_i):
+            continue
+
+        # Protect against ambiguous cases such as having both
+        # P.1.sim_sar.radar.tif and P.0001.sim_sar.radar.tif.
+        if numeric_id in found:
+            raise ValueError(
+                f"Multiple files represent numeric ID {numeric_id}: "
+                f"{found[numeric_id]!r} and {raw_id!r}"
+            )
+
+        # Keep the ID exactly as it appears in the filename.
+        found[numeric_id] = raw_id
+
+    if not found:
+        raise FileNotFoundError(
+            f"No SimSAR files matching {simsar_pattern!r} "
+            f"were found in {simsar_dir} for IDs "
+            f"{start_i} to {end_i}."
+        )
+
+    run_ids = [
+        found[numeric_id]
+        for numeric_id in sorted(found)
+    ]
+
+    print(
+        f"Found {len(run_ids)} SimSAR files for numeric IDs "
+        f"{start_i}–{end_i}."
+    )
+
+    return run_ids
 
 def main() -> None:
     base = load_base_module()
@@ -487,7 +562,9 @@ def main() -> None:
         pick_continuous_simsar_edge_with_sim_prominence
     )
 
-    run_ids = base.build_run_ids(
+    run_ids = discover_run_ids(
+        args.simsar_dir,
+        args.simsar_pattern,
         args.id_start,
         args.id_end,
     )
