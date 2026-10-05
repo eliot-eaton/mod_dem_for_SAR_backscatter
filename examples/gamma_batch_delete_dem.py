@@ -32,6 +32,19 @@ Allow two OpenMP threads inside each GAMMA subprocess::
 Existing final TIFFs are skipped unless ``--overwrite`` is supplied.
 After a job succeeds, its input ``P.{ID}.dem`` is deleted by default; use
 ``--keep-input-dem`` to retain it.
+
+
+nohup python ../mod_dem_for_SAR_backscatter/examples/gamma_batch_delete_dem.py \
+    mod_dem_Dome/synthetic_sweep_excavate_fill \
+    sim_sar_dome_sweep \
+    slcs/20210208M/20210208.mli.par \
+    "000501-005276" \
+    -j 1 \
+    --gamma-threads 1 \
+    > nohup_dome.out 2>&1 &
+
+
+    
 """
 
 from __future__ import annotations

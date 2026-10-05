@@ -40,7 +40,7 @@ from scipy.signal import find_peaks
 # =============================================================================
 
 PROFILE_X1 = 810
-PROFILE_X2 = 900
+PROFILE_X2 = 920
 
 PLOT_PROFILE_LABELS = ("A", "B", "C")
 PLOT_PROFILE_ROWS = (2030, 2010, 1990)

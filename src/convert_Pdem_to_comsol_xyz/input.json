@@ -1,0 +1,15 @@
+{
+  "DATA": "mod_dem_Dome",
+  "RUN_DIR": "synthetic_sweep_excavate_fill",
+  "ID": "006773",
+  "PAR": "P.dem_par",
+  "OUTPUT_XYZ": "P.006773.xyz",
+  "CROP_LAT_MIN": 3.15,
+  "CROP_LAT_MAX": 3.2,
+  "CROP_LON_MIN": 98.37,
+  "CROP_LON_MAX": 98.42,
+  "FADE_PIXELS": 50,
+  "FLAT_PAD_PIXELS": 50,
+  "BASE_ELEVATION_M": 1248,
+  "XYZ_DECIMALS": 2
+}

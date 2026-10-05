@@ -13,6 +13,14 @@ and scoring, but allows different prominence thresholds for:
 
 Place this file in the same `examples/` directory as
 `invert_simsar_continuous_edge.py`, then run this file instead of the original.
+
+nohup python ../mod_dem_for_SAR_backscatter/examples/invert_simsar_continuous_edge_shadow_floor.py     ./mli_tifs/2020-2021/20200109.mli.tif     ./sim_sar_crater/     1 6500     --median-size 15     --mli-peak-prominence-db 5     --simsar-peak-prominence-db 2     --simsar-median-size 1     --peak-sigma 0.5     --peak-distance-pixels 2     --simsar-shadow-floor-db -30     --simsar-shadow-pad-pixels 3     --min-coverage 0.8     --azimuth-min 1965     --azimuth-max 2080     --interaction excavate_to_lower     --provenance-dir ./mod_dem_crater/synthetic_sweep/     --simsar-continuity-penalty 0.15     --simsar-max-jump-pixels 6
+python ../mod_dem_for_SAR_backscatter/examples/invert_simsar_continuous_edge_shadow_floor.py     ./mli_tifs/2020-2021/20200109.mli.tif     ./sim_sar_crater/     6500 6550     --median-size 15     --mli-peak-prominence-db 5     --simsar-peak-prominence-db 2     --simsar-median-size 1     --peak-sigma 0.5     --peak-distance-pixels 2     --simsar-shadow-floor-db -30     --simsar-shadow-pad-pixels 3     --min-coverage 0.8     --azimuth-min 1965     --azimuth-max 2080     --interaction excavate_to_lower     --provenance-dir ./mod_dem_crater/synthetic_sweep/     --simsar-continuity-penalty 0.15     --simsar-max-jump-pixels 4
+
+nohup python ../mod_dem_for_SAR_backscatter/examples/invert_simsar_continuous_edge_shadow_floor.py     ./mli_tifs/2020-2021/20201101.mli.tif     ./sim_sar_dome_sweep/     1 1500     --median-size 15     --mli-peak-prominence-db 4     --simsar-peak-prominence-db 2     --simsar-median-size 1     --peak-sigma 0.5     --peak-distance-pixels 2     --simsar-shadow-floor-db -30     --simsar-shadow-pad-pixels 3     --min-coverage 0.8     --azimuth-min 1965     --azimuth-max 2080         --provenance-dir ./mod_dem_Dome/synthetic_sweep_excavate_fill/     --simsar-continuity-penalty 0.15     --simsar-max-jump-pixels 6
+
+python ../mod_dem_for_SAR_backscatter/examples/invert_simsar_continuous_edge_shadow_floor.py     ./mli_tifs/2020-2021/20200109.mli.tif     ./sim_sar_crater/     6500 6550     --median-size 15     --mli-peak-prominence-db 5     --simsar-peak-prominence-db 2.5     --simsar-median-size 1     --peak-sigma 0.5     --peak-distance-pixels 2     --simsar-shadow-floor-db -30     --simsar-shadow-pad-pixels 3     --min-coverage 0.8     --azimuth-min 1925     --azimuth-max 2140     --interaction excavate_to_lower     --provenance-dir ./mod_dem_crater/synthetic_sweep/     --simsar-continuity-penalty 0.15     --simsar-max-jump-pixels 4
+
 """
 
 from __future__ import annotations
