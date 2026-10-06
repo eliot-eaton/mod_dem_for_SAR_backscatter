@@ -1,9 +1,9 @@
 {
   "DATA": "mod_dem_Dome",
-  "RUN_DIR": "synthetic_sweep_excavate_fill",
+  "RUN_DIR": "synthetic_sweep",
   "ID": "006773",
   "PAR": "P.dem_par",
-  "OUTPUT_XYZ": "P.006773.xyz",
+  "OUTPUT_XYZ": "P.006799.xyz",
   "CROP_LAT_MIN": 3.15,
   "CROP_LAT_MAX": 3.2,
   "CROP_LON_MIN": 98.37,
