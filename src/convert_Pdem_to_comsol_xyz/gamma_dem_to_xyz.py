@@ -5,8 +5,8 @@ gamma_dem_to_xyz.py
 Convert one modified GAMMA DEM to projected-metre XYZ.
 
 Processing order:
-    1. Read P.<ID>.dem on its original geographic GAMMA grid.
-    2. Crop to a rectangular latitude/longitude box.
+    1. Read P.<ID>.dem, or reconstruct it in memory from <ID>.json if deleted.
+    2. Crop the modified geographic DEM to a rectangular latitude/longitude box.
     3. Project the cropped DEM to a locally appropriate metre CRS.
     4. Replace residual NaNs with the chosen base elevation.
     5. Add a linear fade to the base elevation.
@@ -25,7 +25,13 @@ from pathlib import Path
 
 import numpy as np
 
-from toposhapes_sar import project_dem_nearest, read_gamma_dem
+from toposhapes_sar import (
+    RotatedEllipsoid,
+    apply_shape,
+    project_dem_nearest,
+    read_gamma_dem,
+    transfer_displacement_to_original_grid,
+)
 
 
 def read_input_file(path: Path) -> dict:
@@ -58,6 +64,101 @@ def optional_float(params, key, default=None):
     if value is None:
         return default
     return float(value)
+
+
+def load_json(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict):
+        raise ValueError(f"Expected a JSON object in {path}")
+    return obj
+
+
+def reconstruct_dem_from_metadata(metadata_path: Path, data_dir: Path):
+    """Reconstruct a deleted P.<ID>.dem in memory from its provenance JSON."""
+    record = load_json(metadata_path)
+
+    source_dem_value = record.get("source_dem")
+    source_par_value = record.get("source_dem_par")
+    if not source_dem_value or not source_par_value:
+        raise ValueError(f"{metadata_path} does not contain source_dem/source_dem_par.")
+
+    source_dem = Path(source_dem_value)
+    source_par = Path(source_par_value)
+
+    if not source_dem.exists():
+        candidate = data_dir / source_dem.name
+        if candidate.exists():
+            source_dem = candidate
+    if not source_par.exists():
+        candidate = data_dir / source_par.name
+        if candidate.exists():
+            source_par = candidate
+
+    if not source_dem.exists():
+        raise FileNotFoundError(
+            f"Original source DEM required for reconstruction was not found: {source_dem_value}"
+        )
+    if not source_par.exists():
+        raise FileNotFoundError(
+            f"Original source DEM parameter file was not found: {source_par_value}"
+        )
+
+    shapes = record.get("shapes")
+    if not isinstance(shapes, list) or len(shapes) == 0:
+        raise ValueError(f"{metadata_path} contains no shape records.")
+
+    print("      reconstructing deleted DEM from metadata")
+    print(f"      metadata:         {metadata_path}")
+    print(f"      source DEM:       {source_dem}")
+    print(f"      source DEM par:   {source_par}")
+    print(f"      stored shapes:    {len(shapes)}")
+
+    dem_geo_original, _ = read_gamma_dem(source_dem, source_par)
+    dem_m_original = project_dem_nearest(dem_geo_original)
+    dem_m_current = dem_m_original.copy()
+
+    for i, shape_record in enumerate(shapes, start=1):
+        shape_type = shape_record.get("type")
+        if shape_type != "ellipsoid":
+            raise ValueError(
+                f"Unsupported shape type {shape_type!r} in {metadata_path}. "
+                "This reconstruction currently supports ellipsoid records."
+            )
+
+        center = shape_record.get("center_xyz_m")
+        semi_axes = shape_record.get("semi_axes_m")
+        rotation = shape_record.get("rotation_deg", [0.0, 0.0, 0.0])
+        interaction = shape_record.get("interaction")
+        if center is None or semi_axes is None or interaction is None:
+            raise ValueError(
+                f"Shape {i} in {metadata_path} is missing centre, semi-axes, or interaction."
+            )
+
+        shape = RotatedEllipsoid(
+            center=tuple(float(v) for v in center),
+            semi_axes=tuple(float(v) for v in semi_axes),
+            rotation_deg=tuple(float(v) for v in rotation),
+        )
+
+        print(
+            f"      shape {i}:         centre={tuple(center)}, "
+            f"semi_axes={tuple(semi_axes)}, rotation={tuple(rotation)}, "
+            f"interaction={interaction}"
+        )
+
+        dem_m_current, _ = apply_shape(
+            dem_m_current,
+            shape,
+            interaction=interaction,
+        )
+
+    dz_total = dem_m_current - dem_m_original
+    dem_geo_modified, _ = transfer_displacement_to_original_grid(
+        dem_geo_original,
+        dz_total,
+    )
+    return dem_geo_modified
 
 
 def linear_fade_pad_2d(img: np.ndarray, n: int, target: float) -> np.ndarray:
@@ -160,6 +261,7 @@ def main():
     par_path = data_dir / required(params, "PAR")
 
     dem_path = run_dir / f"P.{run_id}.dem"
+    metadata_path = run_dir / f"{run_id}.json"
 
     output_value = params.get("OUTPUT_XYZ", f"P.{run_id}.xyz")
     xyz_path = Path(output_value)
@@ -187,19 +289,30 @@ def main():
     if fade < 0 or flat < 0:
         raise ValueError("Padding widths must be >= 0.")
 
-    if not dem_path.exists():
-        raise FileNotFoundError(f"DEM not found: {dem_path}")
     if not par_path.exists():
         raise FileNotFoundError(f"Parameter file not found: {par_path}")
 
     print(f"\nInput file: {args.input_file}")
     print(f"Run ID:     {run_id}")
 
-    # 1. Read geographic DEM.
-    print("\n[1/6] Reading GAMMA DEM")
-    dem_geo, meta = read_gamma_dem(dem_path, par_path)
+    # 1. Obtain modified DEM on the geographic grid.
+    print("\n[1/6] Loading/reconstructing modified DEM")
 
-    print(f"      DEM:             {dem_path}")
+    if dem_path.exists():
+        dem_geo, _ = read_gamma_dem(dem_path, par_path)
+        print(f"      using existing:   {dem_path}")
+    else:
+        if not metadata_path.exists():
+            raise FileNotFoundError(
+                f"Neither modified DEM nor metadata JSON exists:\n"
+                f"  {dem_path}\n"
+                f"  {metadata_path}"
+            )
+        dem_geo = reconstruct_dem_from_metadata(
+            metadata_path=metadata_path,
+            data_dir=data_dir,
+        )
+
     print(f"      geographic CRS:  {dem_geo.rio.crs}")
     print(f"      original shape:  {dem_geo.shape}")
 
