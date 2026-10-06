@@ -140,7 +140,7 @@ PAR = DATA / "P.dem_par"
 # -----------------------------------------------------------------------------
 
 EXCAVATION_JSON = Path(
-    "mod_dem_crater/synthetic_sweep/0075.json"
+    "mod_dem_crater/synthetic_sweep/006799.json"
 )
 
 
@@ -224,6 +224,7 @@ BATCH_1_X_VALUES = [
     432525.0,
     432550.0,
     432575.0,
+    432600.0,
 ]
 
 
@@ -253,18 +254,20 @@ BATCH_1_Y_VALUES = [
 BATCH_1_Z_C_PAIRS = [
 
     # Strong extension below previous model space
-    (2225.0, 40.0),
-    (2250.0, 40.0),
-    (2250.0, 50.0),
+    (2225.0, 90),
+    (2250.0, 95.0),
+    (2250.0, 82.5),
 
-    (2275.0, 40.0),
-    (2275.0, 50.0),
-    (2275.0, 60.0),
+    (2275.0, 75.0),
+    (2275.0, 75.0),
+    (2275.0, 90.0),
+    (2275.0, 102.5),
 
     # Around / just below previous lower boundary
-    (2300.0, 50.0),
     (2300.0, 60.0),
+    (2300.0, 67.5),
     (2300.0, 75.0),
+    (2300.0, 90.0),
 
     # Bridge to previous space
     (2325.0, 75.0),
