@@ -35,13 +35,14 @@ mpl.rcParams.update({
 # SETTINGS
 # =============================================================================
 
-BASE_DIR = Path("/scratch/ee16eme/sinabung_asc_tsx/new_dense_for_each_date")
+BASE_DIR = Path(
+    "/scratch/ee16eme/sinabung_asc_tsx/new_dense_for_each_date"
+)
 
-MODEL_DIR = (
-    BASE_DIR
-    / '../'
-    / "mod_dem_Dome"
-    / "synthetic_sweep_excavate6799_existing_fill"
+MODEL_DIR = Path(
+    "/scratch/ee16eme/sinabung_asc_tsx/"
+    "mod_dem_Dome/"
+    "synthetic_sweep_excavate6799_existing_fill"
 )
 
 DATES = [
@@ -58,9 +59,20 @@ DATES = [
 # Number of lowest-RMSE models shown at each date
 N_BEST = 5
 
-OUTPUT_FIGURE = BASE_DIR / "top5_model_evolution.png"
-OUTPUT_PDF = BASE_DIR / "top5_model_evolution.pdf"
-OUTPUT_CSV = BASE_DIR / "top5_model_evolution.csv"
+OUTPUT_FIGURE = (
+    BASE_DIR
+    / "top5_model_evolution.png"
+)
+
+OUTPUT_PDF = (
+    BASE_DIR
+    / "top5_model_evolution.pdf"
+)
+
+OUTPUT_CSV = (
+    BASE_DIR
+    / "top5_model_evolution.csv"
+)
 
 
 # =============================================================================
@@ -69,9 +81,13 @@ OUTPUT_CSV = BASE_DIR / "top5_model_evolution.csv"
 
 rows = []
 
-json_files = sorted(MODEL_DIR.glob("*.json"))
+json_files = sorted(
+    MODEL_DIR.glob("*.json")
+)
 
-print(f"Found {len(json_files)} JSON files")
+print(
+    f"Found {len(json_files)} JSON files"
+)
 
 
 for json_file in json_files:
@@ -79,73 +95,321 @@ for json_file in json_files:
     with open(json_file) as f:
         metadata = json.load(f)
 
-    run_id = json_file.stem
+    # -------------------------------------------------------------------------
+    # Run ID
+    # -------------------------------------------------------------------------
+
+    run_id = str(
+        metadata.get(
+            "id",
+            json_file.stem,
+        )
+    ).zfill(6)
+
+
+    # -------------------------------------------------------------------------
+    # Find excavation and fill records
+    # -------------------------------------------------------------------------
 
     excavation = None
     fill = None
 
-    # Find the excavation and fill records
-    for shape in metadata["shapes"]:
+    for shape in metadata.get(
+        "shapes",
+        [],
+    ):
 
-        if shape.get("role") == "excavation":
+        role = shape.get("role")
+
+        interaction = shape.get(
+            "interaction"
+        )
+
+        if (
+            role == "excavation"
+            or interaction == "excavate_to_lower"
+        ):
             excavation = shape
 
-        elif shape.get("role") == "fill":
+        elif (
+            role == "fill"
+            or interaction == "fill_to_upper"
+        ):
             fill = shape
 
+
     if excavation is None or fill is None:
-        print(f"Skipping {json_file.name}: missing excavation or fill")
+
+        print(
+            f"Skipping {json_file.name}: "
+            f"missing excavation or fill"
+        )
+
         continue
 
-    # Geometry
-    exc = excavation["sweep_parameters"]
-    fil = fill["sweep_parameters"]
 
-    exc_a, exc_b, exc_c = exc["semi_axes_m"]
-    fill_a, fill_b, fill_c = fil["semi_axes_m"]
+    # =========================================================================
+    # EXCAVATION GEOMETRY
+    # =========================================================================
+    #
+    # Older JSONs may contain:
+    #
+    #     excavation["sweep_parameters"]
+    #
+    # Newer fixed-excavation JSONs may instead contain the geometry directly:
+    #
+    #     excavation["center_xyz_m"]
+    #     excavation["semi_axes_m"]
+    #
+    # Support both formats.
+    # =========================================================================
 
-    # Volume diagnostics
-    exc_volume = excavation["volume_diagnostics"]
-    fill_volume = fill["volume_diagnostics"]
+    if "sweep_parameters" in excavation:
 
-    # Final modified DEM relative to original DEM
-    final_volume = fill["combined_final_diagnostics"]
+        exc = excavation[
+            "sweep_parameters"
+        ]
+
+        exc_x = float(
+            exc["x_m"]
+        )
+
+        exc_y = float(
+            exc["y_m"]
+        )
+
+        exc_z = float(
+            exc["z_m"]
+        )
+
+        exc_a, exc_b, exc_c = [
+            float(v)
+            for v in exc[
+                "semi_axes_m"
+            ]
+        ]
+
+    else:
+
+        exc_x, exc_y, exc_z = [
+            float(v)
+            for v in excavation[
+                "center_xyz_m"
+            ]
+        ]
+
+        exc_a, exc_b, exc_c = [
+            float(v)
+            for v in excavation[
+                "semi_axes_m"
+            ]
+        ]
+
+
+    # =========================================================================
+    # FILL GEOMETRY
+    # =========================================================================
+    #
+    # Again support both formats.
+    # =========================================================================
+
+    if "sweep_parameters" in fill:
+
+        fil = fill[
+            "sweep_parameters"
+        ]
+
+        fill_x = float(
+            fil["x_m"]
+        )
+
+        fill_y = float(
+            fil["y_m"]
+        )
+
+        fill_z = float(
+            fil["z_m"]
+        )
+
+        fill_a, fill_b, fill_c = [
+            float(v)
+            for v in fil[
+                "semi_axes_m"
+            ]
+        ]
+
+    else:
+
+        fill_x, fill_y, fill_z = [
+            float(v)
+            for v in fill[
+                "center_xyz_m"
+            ]
+        ]
+
+        fill_a, fill_b, fill_c = [
+            float(v)
+            for v in fill[
+                "semi_axes_m"
+            ]
+        ]
+
+
+    # =========================================================================
+    # VOLUME DIAGNOSTICS
+    # =========================================================================
+
+    exc_volume = excavation[
+        "volume_diagnostics"
+    ]
+
+    fill_volume = fill[
+        "volume_diagnostics"
+    ]
+
+
+    # -------------------------------------------------------------------------
+    # Final modified DEM relative to the original DEM
+    #
+    # This is the volume quantity we want to use for the final added volume.
+    # -------------------------------------------------------------------------
+
+    final_volume = fill[
+        "combined_final_diagnostics"
+    ]
+
+
+    # =========================================================================
+    # SOURCE MODEL INFORMATION
+    # =========================================================================
+
+    source_excavation_run_id = (
+        excavation.get(
+            "source_excavation_run_id"
+        )
+    )
+
+    source_fill_run_id = (
+        fill.get(
+            "source_fill_run_id"
+        )
+    )
+
+
+    # =========================================================================
+    # STORE MODEL
+    # =========================================================================
 
     rows.append(
         {
-            "run_id": run_id,
+            "run_id":
+                run_id,
 
+            # -----------------------------------------------------------------
+            # Source models
+            # -----------------------------------------------------------------
+
+            "source_excavation_run_id":
+                source_excavation_run_id,
+
+            "source_fill_run_id":
+                source_fill_run_id,
+
+            # -----------------------------------------------------------------
             # Excavation geometry
-            "excavation_x_m": exc["x_m"],
-            "excavation_y_m": exc["y_m"],
-            "excavation_z_m": exc["z_m"],
-            "excavation_a_m": exc_a,
-            "excavation_b_m": exc_b,
-            "excavation_c_m": exc_c,
+            # -----------------------------------------------------------------
 
+            "excavation_x_m":
+                exc_x,
+
+            "excavation_y_m":
+                exc_y,
+
+            "excavation_z_m":
+                exc_z,
+
+            "excavation_a_m":
+                exc_a,
+
+            "excavation_b_m":
+                exc_b,
+
+            "excavation_c_m":
+                exc_c,
+
+            # -----------------------------------------------------------------
             # Fill geometry
-            "fill_x_m": fil["x_m"],
-            "fill_y_m": fil["y_m"],
-            "fill_z_m": fil["z_m"],
-            "fill_a_m": fill_a,
-            "fill_b_m": fill_b,
-            "fill_c_m": fill_c,
+            # -----------------------------------------------------------------
 
-            # Volume diagnostics
+            "fill_x_m":
+                fill_x,
+
+            "fill_y_m":
+                fill_y,
+
+            "fill_z_m":
+                fill_z,
+
+            "fill_a_m":
+                fill_a,
+
+            "fill_b_m":
+                fill_b,
+
+            "fill_c_m":
+                fill_c,
+
+            # -----------------------------------------------------------------
+            # Excavation volume
+            # -----------------------------------------------------------------
+
             "excavation_removed_volume_m3":
-                exc_volume["removed_volume_m3"],
+                float(
+                    exc_volume[
+                        "removed_volume_m3"
+                    ]
+                ),
+
+            # -----------------------------------------------------------------
+            # Fill-operation volume
+            #
+            # This is only what the fill operation itself added.
+            # -----------------------------------------------------------------
 
             "fill_added_volume_m3":
-                fill_volume["added_volume_m3"],
+                float(
+                    fill_volume[
+                        "added_volume_m3"
+                    ]
+                ),
+
+            # -----------------------------------------------------------------
+            # Final DEM volumes
+            #
+            # These describe the final combined excavation + fill DEM relative
+            # to the original DEM.
+            # -----------------------------------------------------------------
 
             "final_added_volume_m3":
-                final_volume["added_volume_m3"],
+                float(
+                    final_volume[
+                        "added_volume_m3"
+                    ]
+                ),
 
             "final_removed_volume_m3":
-                final_volume["removed_volume_m3"],
+                float(
+                    final_volume[
+                        "removed_volume_m3"
+                    ]
+                ),
 
             "final_net_volume_m3":
-                final_volume["net_volume_change_m3"],
+                float(
+                    final_volume[
+                        "net_volume_change_m3"
+                    ]
+                ),
         }
     )
 
@@ -154,22 +418,88 @@ for json_file in json_files:
 # 2. CREATE MODEL METADATA DATAFRAME
 # =============================================================================
 
-models = pd.DataFrame(rows)
+models = pd.DataFrame(
+    rows
+)
 
-models["run_number"] = models["run_id"].astype(int)
+
+# -----------------------------------------------------------------------------
+# Give a useful error if no models could be loaded.
+# -----------------------------------------------------------------------------
+
+if models.empty:
+
+    raise RuntimeError(
+        "No usable excavation + fill models "
+        f"were read from:\n{MODEL_DIR}"
+    )
+
+
+models["run_number"] = (
+    models["run_id"]
+    .astype(int)
+)
+
 
 models = (
     models
-    .sort_values("run_number")
-    .reset_index(drop=True)
+    .sort_values(
+        "run_number"
+    )
+    .reset_index(
+        drop=True
+    )
 )
 
+
+# -----------------------------------------------------------------------------
 # Final added volume in millions of cubic metres
-models["final_added_volume_Mm3"] = (
-    models["final_added_volume_m3"] / 1e6
+# -----------------------------------------------------------------------------
+
+models[
+    "final_added_volume_Mm3"
+] = (
+    models[
+        "final_added_volume_m3"
+    ]
+    / 1e6
 )
 
-print(f"Models loaded: {len(models)}")
+
+print(
+    f"Models loaded: {len(models)}"
+)
+
+
+# -----------------------------------------------------------------------------
+# Print basic information about the fixed excavation
+# -----------------------------------------------------------------------------
+
+print()
+print(
+    "Unique excavation geometries:"
+)
+
+unique_excavations = (
+    models[
+        [
+            "excavation_x_m",
+            "excavation_y_m",
+            "excavation_z_m",
+            "excavation_a_m",
+            "excavation_b_m",
+            "excavation_c_m",
+        ]
+    ]
+    .drop_duplicates()
+)
+
+
+print(
+    unique_excavations.to_string(
+        index=False
+    )
+)
 
 
 # =============================================================================
@@ -191,74 +521,169 @@ for date_string in DATES:
         / "peak_model_ranking.csv"
     )
 
-    print(f"Reading {ranking_file}")
+
+    print()
+    print(
+        f"Reading {ranking_file}"
+    )
+
+
+    if not ranking_file.exists():
+
+        raise FileNotFoundError(
+            f"Ranking file not found:\n"
+            f"{ranking_file}"
+        )
+
 
     ranking = pd.read_csv(
         ranking_file,
-        dtype={"run_id": str},
+        dtype={
+            "run_id": str,
+        },
     )
 
-    # Keep six-digit IDs
+
+    # -------------------------------------------------------------------------
+    # Normalise IDs
+    # -------------------------------------------------------------------------
+
     ranking["run_id"] = (
         ranking["run_id"]
+        .str.strip()
         .str.zfill(6)
     )
 
-    # Keep valid models only
+
+    # -------------------------------------------------------------------------
+    # Keep valid inversion results only
+    # -------------------------------------------------------------------------
+
     ranking = ranking[
-        (ranking["status"] == "ok")
-        & ranking["rmse_filtered_m"].notna()
+        (
+            ranking["status"]
+            == "ok"
+        )
+        &
+        ranking[
+            "rmse_filtered_m"
+        ].notna()
     ].copy()
 
-    # Lowest RMSE first
-    ranking = ranking.sort_values(
-        "rmse_filtered_m"
+
+    print(
+        f"    valid inversion models: "
+        f"{len(ranking)}"
     )
 
-    # Keep the lowest five RMSE models
-    ranking = ranking.head(N_BEST).copy()
 
+    # -------------------------------------------------------------------------
+    # Lowest RMSE first
+    # -------------------------------------------------------------------------
+
+    ranking = (
+        ranking
+        .sort_values(
+            "rmse_filtered_m"
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+
+    # -------------------------------------------------------------------------
+    # Keep N lowest-RMSE models
+    # -------------------------------------------------------------------------
+
+    ranking = (
+        ranking
+        .head(N_BEST)
+        .copy()
+    )
+
+
+    # -------------------------------------------------------------------------
     # Rank 1 = best-fitting model
+    # -------------------------------------------------------------------------
+
     ranking["rank"] = range(
         1,
         len(ranking) + 1,
     )
 
+
+    # -------------------------------------------------------------------------
     # Acquisition date
-    ranking["date"] = pd.to_datetime(
-        date_string,
-        format="%Y%m%d",
+    # -------------------------------------------------------------------------
+
+    ranking["date"] = (
+        pd.to_datetime(
+            date_string,
+            format="%Y%m%d",
+        )
     )
 
+
+    # -------------------------------------------------------------------------
     # Join inversion results to model metadata
+    # -------------------------------------------------------------------------
+
     ranking = ranking.merge(
         models,
         on="run_id",
         how="left",
+        validate="many_to_one",
     )
 
-    all_results.append(ranking)
+
+    all_results.append(
+        ranking
+    )
 
 
 # =============================================================================
-# 4. COMBINE DATES
+# 4. COMBINE ALL DATES
 # =============================================================================
+
+if not all_results:
+
+    raise RuntimeError(
+        "No inversion results were loaded."
+    )
+
 
 top5 = pd.concat(
     all_results,
     ignore_index=True,
 )
 
-top5 = top5.sort_values(
-    ["date", "rank"]
+
+top5 = (
+    top5
+    .sort_values(
+        [
+            "date",
+            "rank",
+        ]
+    )
+    .reset_index(
+        drop=True
+    )
 )
 
+
+# -----------------------------------------------------------------------------
 # Rank 1 models only
+# -----------------------------------------------------------------------------
+
 best = (
     top5[
         top5["rank"] == 1
     ]
-    .sort_values("date")
+    .sort_values(
+        "date"
+    )
     .copy()
 )
 
@@ -268,12 +693,23 @@ best = (
 # =============================================================================
 
 missing = top5[
-    top5["final_added_volume_m3"].isna()
+    top5[
+        "final_added_volume_m3"
+    ].isna()
 ]
+
 
 if len(missing) > 0:
 
-    print("\nWARNING: Some run IDs did not match JSON metadata:")
+    print()
+    print("=" * 100)
+
+    print(
+        "WARNING: SOME RUN IDs DID NOT "
+        "MATCH JSON METADATA"
+    )
+
+    print("=" * 100)
 
     print(
         missing[
@@ -282,7 +718,9 @@ if len(missing) > 0:
                 "run_id",
                 "rmse_filtered_m",
             ]
-        ]
+        ].to_string(
+            index=False
+        )
     )
 
 
@@ -290,10 +728,15 @@ if len(missing) > 0:
 # 6. PRINT RESULTS
 # =============================================================================
 
-print("\n")
-print("=" * 100)
-print("FIVE LOWEST-RMSE MODELS FOR EACH DATE")
-print("=" * 100)
+print()
+print("=" * 120)
+
+print(
+    "FIVE LOWEST-RMSE MODELS FOR EACH DATE"
+)
+
+print("=" * 120)
+
 
 print(
     top5[
@@ -301,21 +744,68 @@ print(
             "date",
             "rank",
             "run_id",
+
+            "source_excavation_run_id",
+            "source_fill_run_id",
+
             "fill_a_m",
             "fill_b_m",
             "fill_c_m",
+
             "fill_z_m",
             "fill_x_m",
             "fill_y_m",
+
             "final_added_volume_m3",
+
             "rmse_filtered_m",
         ]
-    ].to_string(index=False)
+    ].to_string(
+        index=False
+    )
 )
 
 
 # =============================================================================
-# 7. SAVE RESULTS TABLE
+# 7. PRINT BEST MODEL FOR EACH DATE
+# =============================================================================
+
+print()
+print("=" * 120)
+
+print(
+    "BEST-FITTING MODEL FOR EACH DATE"
+)
+
+print("=" * 120)
+
+
+print(
+    best[
+        [
+            "date",
+            "run_id",
+
+            "fill_a_m",
+            "fill_b_m",
+            "fill_c_m",
+
+            "fill_z_m",
+            "fill_x_m",
+            "fill_y_m",
+
+            "final_added_volume_m3",
+
+            "rmse_filtered_m",
+        ]
+    ].to_string(
+        index=False
+    )
+)
+
+
+# =============================================================================
+# 8. SAVE RESULTS TABLE
 # =============================================================================
 
 top5.to_csv(
@@ -323,26 +813,73 @@ top5.to_csv(
     index=False,
 )
 
-print(f"\nSaved table: {OUTPUT_CSV}")
+
+print()
+print(
+    f"Saved table: {OUTPUT_CSV}"
+)
 
 
 # =============================================================================
-# 8. PARAMETERS TO PLOT
+# 9. PARAMETERS TO PLOT
 # =============================================================================
 
 plot_parameters = [
 
+    # -------------------------------------------------------------------------
     # Row 1
-    ("fill_a_m", "A", "Semi-axis A (m)", 1),
-    ("fill_b_m", "B", "Semi-axis B (m)", 1),
-    ("fill_c_m", "C", "Semi-axis C (m)", 1),
+    # -------------------------------------------------------------------------
 
+    (
+        "fill_a_m",
+        "A",
+        "Semi-axis A (m)",
+        1,
+    ),
+
+    (
+        "fill_b_m",
+        "B",
+        "Semi-axis B (m)",
+        1,
+    ),
+
+    (
+        "fill_c_m",
+        "C",
+        "Semi-axis C (m)",
+        1,
+    ),
+
+    # -------------------------------------------------------------------------
     # Row 2
-    ("fill_z_m", "z", "z (m)", 1),
-    ("fill_x_m", "x", "x (m)", 1),
-    ("fill_y_m", "y", "y (m)", 1),
+    # -------------------------------------------------------------------------
 
+    (
+        "fill_z_m",
+        "z",
+        "z (m)",
+        1,
+    ),
+
+    (
+        "fill_x_m",
+        "x",
+        "x (m)",
+        1,
+    ),
+
+    (
+        "fill_y_m",
+        "y",
+        "y (m)",
+        1,
+    ),
+
+    # -------------------------------------------------------------------------
     # Row 3
+    # -------------------------------------------------------------------------
+
     (
         "final_added_volume_m3",
         "Final added volume",
@@ -360,7 +897,7 @@ plot_parameters = [
 
 
 # =============================================================================
-# 9. CREATE 3 x 3 FIGURE
+# 10. CREATE 3 x 3 FIGURE
 # =============================================================================
 
 fig, axes = plt.subplots(
@@ -370,18 +907,24 @@ fig, axes = plt.subplots(
     sharex=True,
 )
 
-# Convert to a simple one-dimensional list
+
 axes = axes.flatten()
 
 
 # =============================================================================
-# 10. PLOT PARAMETERS
+# 11. PLOT PARAMETERS
 # =============================================================================
 
-for ax, (column, title, ylabel, scale) in zip(
+for ax, (
+    column,
+    title,
+    ylabel,
+    scale,
+) in zip(
     axes,
     plot_parameters,
 ):
+
 
     # -------------------------------------------------------------------------
     # Five lowest-RMSE models
@@ -395,6 +938,7 @@ for ax, (column, title, ylabel, scale) in zip(
         label="Five lowest RMSE",
         zorder=2,
     )
+
 
     # -------------------------------------------------------------------------
     # Best-fitting model
@@ -410,52 +954,83 @@ for ax, (column, title, ylabel, scale) in zip(
         zorder=3,
     )
 
+
     # -------------------------------------------------------------------------
     # Labels
     # -------------------------------------------------------------------------
 
-    ax.set_title(title)
+    ax.set_title(
+        title
+    )
 
-    ax.set_ylabel(ylabel)
+    ax.set_ylabel(
+        ylabel
+    )
 
+
+    # -------------------------------------------------------------------------
     # Light horizontal grid only
+    # -------------------------------------------------------------------------
+
     ax.grid(
         axis="y",
         alpha=0.2,
         linewidth=0.6,
     )
 
-    # Remove unnecessary top/right borders
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+
+    # -------------------------------------------------------------------------
+    # Remove unnecessary borders
+    # -------------------------------------------------------------------------
+
+    ax.spines[
+        "top"
+    ].set_visible(
+        False
+    )
+
+    ax.spines[
+        "right"
+    ].set_visible(
+        False
+    )
 
 
 # =============================================================================
-# 11. DATE FORMATTING
+# 12. DATE FORMATTING
 # =============================================================================
 
 for ax in axes[:8]:
 
     ax.xaxis.set_major_locator(
-        mdates.MonthLocator(interval=2)
+        mdates.MonthLocator(
+            interval=2
+        )
     )
 
     ax.xaxis.set_major_formatter(
-        mdates.DateFormatter("%b\n%Y")
+        mdates.DateFormatter(
+            "%b\n%Y"
+        )
     )
 
 
 # =============================================================================
-# 12. NINTH PANEL = LEGEND
+# 13. NINTH PANEL = LEGEND
 # =============================================================================
 
 legend_ax = axes[8]
 
-legend_ax.axis("off")
+legend_ax.axis(
+    "off"
+)
 
 
-# Create legend using handles from first plot
-handles, labels = axes[0].get_legend_handles_labels()
+handles, labels = (
+    axes[0]
+    .get_legend_handles_labels()
+)
+
 
 legend_ax.legend(
     handles,
@@ -466,7 +1041,6 @@ legend_ax.legend(
 )
 
 
-# Add short explanation
 legend_ax.text(
     0.5,
     0.28,
@@ -482,7 +1056,7 @@ legend_ax.text(
 
 
 # =============================================================================
-# 13. PANEL LABELS
+# 14. PANEL LABELS
 # =============================================================================
 
 panel_labels = [
@@ -495,6 +1069,7 @@ panel_labels = [
     "(g)",
     "(h)",
 ]
+
 
 for ax, label in zip(
     axes[:8],
@@ -513,7 +1088,7 @@ for ax, label in zip(
 
 
 # =============================================================================
-# 14. FINAL FORMATTING
+# 15. FINAL FORMATTING
 # =============================================================================
 
 fig.suptitle(
@@ -522,15 +1097,21 @@ fig.suptitle(
     y=0.99,
 )
 
+
 fig.tight_layout(
-    rect=[0, 0, 1, 0.97],
+    rect=[
+        0,
+        0,
+        1,
+        0.97,
+    ],
     h_pad=1.3,
     w_pad=1.5,
 )
 
 
 # =============================================================================
-# 15. SAVE
+# 16. SAVE FIGURES
 # =============================================================================
 
 fig.savefig(
@@ -538,17 +1119,24 @@ fig.savefig(
     dpi=300,
 )
 
+
 fig.savefig(
     OUTPUT_PDF,
 )
 
 
-print(f"\nSaved PNG: {OUTPUT_FIGURE}")
-print(f"Saved PDF: {OUTPUT_PDF}")
+print()
+print(
+    f"Saved PNG: {OUTPUT_FIGURE}"
+)
+
+print(
+    f"Saved PDF: {OUTPUT_PDF}"
+)
 
 
 # =============================================================================
-# 16. SHOW
+# 17. SHOW
 # =============================================================================
 
 plt.show()
