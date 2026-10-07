@@ -39,6 +39,7 @@ BASE_DIR = Path("/scratch/ee16eme/sinabung_asc_tsx/new_dense_for_each_date")
 
 MODEL_DIR = (
     BASE_DIR
+    / '../'
     / "mod_dem_Dome"
     / "synthetic_sweep_excavate6799_existing_fill"
 )
