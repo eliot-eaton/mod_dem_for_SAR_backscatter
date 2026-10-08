@@ -1,214 +1,763 @@
+
 #!/usr/bin/env python3
+
 from pathlib import Path
 import json
+
+import numpy as np
 import pandas as pd
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-BASE_DIR = Path("/scratch/ee16eme/sinabung_asc_tsx/new_dense_for_each_date")
-MODEL_DIR = Path("/scratch/ee16eme/sinabung_asc_tsx/mod_dem_Dome/synthetic_sweep_excavate6799_existing_fill")
-DATES = ["20201021", "20201101", "20201226", "20210106", "20210117", "20210128", "20210208", "20210219"]
-mpl.rcParams.update({"figure.figsize": (10, 8), "font.size": 9,
-                     "axes.labelsize": 9, "axes.titlesize": 10,
-                     "savefig.dpi": 300, "pdf.fonttype": 42, "ps.fonttype": 42})
 
-def geometry(shape):
-    sweep = shape.get("sweep_parameters")
-    if sweep is not None:
-        xyz = [float(sweep[k]) for k in ("x_m", "y_m", "z_m")]
-        axes = [float(v) for v in sweep["semi_axes_m"]]
+# =============================================================================
+# PLOT STYLE
+# =============================================================================
+
+mpl.rcParams.update({
+    "figure.figsize": (10.0, 8.0),
+    "font.family": "DejaVu Sans",
+    "font.size": 9,
+    "axes.labelsize": 9,
+    "axes.titlesize": 10,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "legend.fontsize": 8,
+    "lines.linewidth": 1.2,
+    "axes.linewidth": 0.8,
+    "savefig.dpi": 300,
+    "savefig.bbox": "tight",
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+})
+
+
+# =============================================================================
+# SETTINGS
+# =============================================================================
+
+BASE_DIR = Path(
+    "/scratch/ee16eme/sinabung_asc_tsx/new_dense_for_each_date"
+)
+
+MODEL_DIR = Path(
+    "/scratch/ee16eme/sinabung_asc_tsx/"
+    "mod_dem_Dome/synthetic_sweep_excavate6799_existing_fill"
+)
+
+DATES = [
+    "20201021",
+    "20201101",
+    "20201226",
+    "20210106",
+    "20210117",
+    "20210128",
+    "20210208",
+    "20210219",
+]
+
+# Maximum number of selected models per date
+N_BEST = 10
+
+# Only consider models with RMSE strictly below this value
+RMSE_THRESHOLD = 25.0
+
+# Volume penalty:
+# Score = RMSE (m) + LAMBDA_VOLUME * fill volume (million m3)
+#
+# 0.0 = rank only by RMSE
+# 0.5 = weak preference for smaller fill volumes
+# 1.0 = initial volume-aware ranking
+# 2.0 = stronger preference for smaller fill volumes
+#
+# This is a ranking preference, not a physical conversion.
+LAMBDA_VOLUME = 1.0
+
+OUTPUT_FIGURE = BASE_DIR / "top10_volume_prioritised_evolution.png"
+OUTPUT_PDF = BASE_DIR / "top10_volume_prioritised_evolution.pdf"
+OUTPUT_CSV = BASE_DIR / "top10_volume_prioritised_evolution.csv"
+
+# Additional CSV containing all acceptable models, before top-20 selection
+OUTPUT_ALL_ACCEPTABLE_CSV = (
+    BASE_DIR / "all_models_rmse_below_20.csv"
+)
+
+
+# =============================================================================
+# HELPER: READ GEOMETRY FROM EITHER JSON FORMAT
+# =============================================================================
+
+def get_geometry(shape):
+    """
+    Return x, y, z, A, B, C for an ellipsoid.
+
+    Supports:
+      - shape["sweep_parameters"]
+      - shape["center_xyz_m"] and shape["semi_axes_m"]
+    """
+
+    params = shape.get("sweep_parameters")
+
+    if params is not None:
+        x = float(params["x_m"])
+        y = float(params["y_m"])
+        z = float(params["z_m"])
+
+        a, b, c = [
+            float(v) for v in params["semi_axes_m"]
+        ]
+
     else:
-        xyz = [float(v) for v in shape["center_xyz_m"]]
-        axes = [float(v) for v in shape["semi_axes_m"]]
-    return xyz + axes
+        x, y, z = [
+            float(v) for v in shape["center_xyz_m"]
+        ]
+
+        a, b, c = [
+            float(v) for v in shape["semi_axes_m"]
+        ]
+
+    return x, y, z, a, b, c
+
+
+# =============================================================================
+# 1. READ MODEL JSON METADATA
+# =============================================================================
 
 rows = []
-for json_file in sorted(MODEL_DIR.glob("*.json")):
-    with json_file.open() as f:
+
+json_files = sorted(MODEL_DIR.glob("*.json"))
+
+print(f"Found {len(json_files)} JSON files")
+
+if not json_files:
+    raise FileNotFoundError(
+        f"No model JSON files found in:\n{MODEL_DIR}"
+    )
+
+
+for json_file in json_files:
+
+    with open(json_file) as f:
         metadata = json.load(f)
+
+    run_id = str(
+        metadata.get("id", json_file.stem)
+    ).zfill(6)
+
     excavation = None
     fill = None
+
+    # Find excavation and fill shapes
     for shape in metadata.get("shapes", []):
-        if shape.get("role") == "excavation" or shape.get("interaction") == "excavate_to_lower":
+
+        role = shape.get("role")
+        interaction = shape.get("interaction")
+
+        if (
+            role == "excavation"
+            or interaction == "excavate_to_lower"
+        ):
             excavation = shape
-        elif shape.get("role") == "fill" or shape.get("interaction") == "fill_to_upper":
+
+        elif (
+            role == "fill"
+            or interaction == "fill_to_upper"
+        ):
             fill = shape
+
     if excavation is None or fill is None:
-        print(f"Skipping {json_file.name}: missing excavation or fill")
+        print(
+            f"Skipping {json_file.name}: "
+            "missing excavation or fill"
+        )
         continue
-    ex = geometry(excavation)
-    fi = geometry(fill)
-    final = fill["combined_final_diagnostics"]
-    row = {"run_id": str(metadata.get("id", json_file.stem)).zfill(6),
-           "source_excavation_run_id": excavation.get("source_excavation_run_id"),
-           "source_fill_run_id": fill.get("source_fill_run_id"),
-           "excavation_removed_volume_m3": float(excavation["volume_diagnostics"]["removed_volume_m3"]),
-           "fill_added_volume_m3": float(fill["volume_diagnostics"]["added_volume_m3"]),
-           "final_added_volume_m3": float(final["added_volume_m3"]),
-           "final_removed_volume_m3": float(final["removed_volume_m3"]),
-           "final_net_volume_m3": float(final["net_volume_change_m3"])}
-    for prefix, vals in (("excavation", ex), ("fill", fi)):
-        row.update({f"{prefix}_{name}_m": value for name, value in zip(("x", "y", "z", "a", "b", "c"), vals)})
-    rows.append(row)
+
+    # -------------------------------------------------------------------------
+    # Geometry
+    # -------------------------------------------------------------------------
+
+    (
+        exc_x, exc_y, exc_z,
+        exc_a, exc_b, exc_c
+    ) = get_geometry(excavation)
+
+    (
+        fill_x, fill_y, fill_z,
+        fill_a, fill_b, fill_c
+    ) = get_geometry(fill)
+
+    # -------------------------------------------------------------------------
+    # Volume diagnostics
+    # -------------------------------------------------------------------------
+
+    exc_volume = excavation["volume_diagnostics"]
+    fill_volume = fill["volume_diagnostics"]
+
+    # IMPORTANT:
+    #
+    # Use the volume added by the fill_to_upper operation.
+    #
+    # This is measured relative to the excavated crater,
+    # NOT relative to the original unmodified DEM.
+    #
+    # Do not use combined_final_diagnostics["added_volume_m3"]
+    # for selection or ranking.
+
+    fill_added_volume_m3 = float(
+        fill_volume["added_volume_m3"]
+    )
+
+    # Store metadata
+    rows.append({
+        "run_id": run_id,
+
+        "source_excavation_run_id":
+            excavation.get("source_excavation_run_id"),
+
+        "source_fill_run_id":
+            fill.get("source_fill_run_id"),
+
+        # Excavation geometry
+        "excavation_x_m": exc_x,
+        "excavation_y_m": exc_y,
+        "excavation_z_m": exc_z,
+        "excavation_a_m": exc_a,
+        "excavation_b_m": exc_b,
+        "excavation_c_m": exc_c,
+
+        # Fill geometry
+        "fill_x_m": fill_x,
+        "fill_y_m": fill_y,
+        "fill_z_m": fill_z,
+        "fill_a_m": fill_a,
+        "fill_b_m": fill_b,
+        "fill_c_m": fill_c,
+
+        # Excavation volume (informational only)
+        "excavation_removed_volume_m3": float(
+            exc_volume["removed_volume_m3"]
+        ),
+
+        # The ONLY volume used for model selection
+        "fill_added_volume_m3": fill_added_volume_m3,
+    })
+
+
+# =============================================================================
+# 2. CREATE MODEL METADATA DATAFRAME
+# =============================================================================
+
 models = pd.DataFrame(rows)
+
 if models.empty:
-    raise RuntimeError(f"No usable excavation + fill models were read from: {MODEL_DIR}")
+    raise RuntimeError(
+        f"No usable excavation + fill models found in:\n{MODEL_DIR}"
+    )
+
+if models["run_id"].duplicated().any():
+    raise RuntimeError("Duplicate run IDs found in model metadata.")
+
 models["run_number"] = models["run_id"].astype(int)
-models = models.sort_values("run_number").reset_index(drop=True)
-models["final_added_volume_Mm3"] = models["final_added_volume_m3"] / 1e6
+
+models = (
+    models
+    .sort_values("run_number")
+    .reset_index(drop=True)
+)
+
+models["fill_added_volume_Mm3"] = (
+    models["fill_added_volume_m3"] / 1e6
+)
+
 print(f"Models loaded: {len(models)}")
-print("Unique excavation geometries:")
-print(models[[f"excavation_{name}_m" for name in ("x", "y", "z", "a", "b", "c")]].drop_duplicates().to_string(index=False))
 
-import numpy as np
+print("\nUnique excavation geometries:")
 
-N_BEST = 20
-# Larger values make the ensemble weights more nearly uniform.
-# The spread in the best 20 RMSE values is the per-date temperature.
-WEIGHT_TEMPERATURE_FRACTION = 0.5
-OUTPUT_FIGURE = BASE_DIR / "top20_weighted_model_evolution.png"
-OUTPUT_PDF = BASE_DIR / "top20_weighted_model_evolution.pdf"
-OUTPUT_CSV = BASE_DIR / "top20_weighted_model_evolution.csv"
-OUTPUT_SUMMARY_CSV = BASE_DIR / "top20_weighted_model_summary.csv"
+print(
+    models[
+        [
+            "excavation_x_m",
+            "excavation_y_m",
+            "excavation_z_m",
+            "excavation_a_m",
+            "excavation_b_m",
+            "excavation_c_m",
+        ]
+    ]
+    .drop_duplicates()
+    .to_string(index=False)
+)
+
+
+# =============================================================================
+# 3. READ AND RANK INVERSION RESULTS FOR EACH DATE
+# =============================================================================
+
+all_results = []
+all_acceptable_results = []
+
+for date_string in DATES:
+
+    inversion_dir = (
+        BASE_DIR
+        / f"peak_model_inversion_dense_{date_string}"
+    )
+
+    ranking_file = (
+        inversion_dir
+        / "peak_model_ranking.csv"
+    )
+
+    print(f"\nReading {ranking_file}")
+
+    if not ranking_file.exists():
+        raise FileNotFoundError(
+            f"Ranking file not found:\n{ranking_file}"
+        )
+
+    ranking = pd.read_csv(
+        ranking_file,
+        dtype={"run_id": str},
+    )
+
+    ranking["run_id"] = (
+        ranking["run_id"]
+        .str.strip()
+        .str.zfill(6)
+    )
+
+    ranking["rmse_filtered_m"] = pd.to_numeric(
+        ranking["rmse_filtered_m"],
+        errors="coerce",
+    )
+
+    # -------------------------------------------------------------------------
+    # Filter by acceptable RMSE
+    # -------------------------------------------------------------------------
+
+    ranking = ranking[
+        (ranking["status"] == "ok")
+        & np.isfinite(ranking["rmse_filtered_m"])
+        & (ranking["rmse_filtered_m"] < RMSE_THRESHOLD)
+    ].copy()
+
+    n_acceptable_before_merge = len(ranking)
+
+    # -------------------------------------------------------------------------
+    # Join model metadata BEFORE volume-based ranking
+    # -------------------------------------------------------------------------
+
+    ranking = ranking.merge(
+        models,
+        on="run_id",
+        how="inner",
+        validate="many_to_one",
+    )
+
+    n_missing_metadata = (
+        n_acceptable_before_merge - len(ranking)
+    )
+
+    if n_missing_metadata:
+        print(
+            f"  WARNING: {n_missing_metadata} acceptable "
+            "ranking rows have no matching model JSON."
+        )
+
+    # -------------------------------------------------------------------------
+    # Exclude missing or invalid fill volumes
+    # -------------------------------------------------------------------------
+
+    ranking = ranking[
+        np.isfinite(ranking["fill_added_volume_Mm3"])
+        & (ranking["fill_added_volume_Mm3"] >= 0)
+    ].copy()
+
+    # -------------------------------------------------------------------------
+    # Calculate volume-aware score
+    #
+    # Lower is better.
+    # -------------------------------------------------------------------------
+
+    ranking["score"] = (
+        ranking["rmse_filtered_m"]
+        + LAMBDA_VOLUME * ranking["fill_added_volume_Mm3"]
+    )
+
+    # Sort using volume-aware score
+    ranking = ranking.sort_values(
+        [
+            "score",
+            "rmse_filtered_m",
+            "fill_added_volume_Mm3",
+            "run_id",
+        ]
+    ).reset_index(drop=True)
+
+    # Add acquisition date
+    ranking["date"] = pd.to_datetime(
+        date_string,
+        format="%Y%m%d",
+    )
+
+    # Save all acceptable models before top-20 selection
+    all_acceptable_results.append(ranking.copy())
+
+    # -------------------------------------------------------------------------
+    # Select 20 preferred models
+    # -------------------------------------------------------------------------
+
+    selected = ranking.head(N_BEST).copy()
+
+    selected["rank"] = range(
+        1,
+        len(selected) + 1,
+    )
+
+    all_results.append(selected)
+
+    print(
+        f"  Models with RMSE < {RMSE_THRESHOLD}: "
+        f"{n_acceptable_before_merge}"
+    )
+
+    print(
+        f"  Models with usable metadata: {len(ranking)}"
+    )
+
+    print(
+        f"  Selected: {len(selected)}"
+    )
+
+    if not selected.empty:
+        print(
+            "  Best volume-aware model: "
+            f"{selected.iloc[0]['run_id']}"
+        )
+
+        print(
+            "  RMSE: "
+            f"{selected.iloc[0]['rmse_filtered_m']:.3f} m"
+        )
+
+        print(
+            "  Fill volume: "
+            f"{selected.iloc[0]['fill_added_volume_Mm3']:.3f} "
+            "million m3"
+        )
+
+
+# =============================================================================
+# 4. COMBINE DATES
+# =============================================================================
+
+top20 = pd.concat(
+    all_results,
+    ignore_index=True,
+)
+
+all_acceptable = pd.concat(
+    all_acceptable_results,
+    ignore_index=True,
+)
+
+if top20.empty:
+    raise RuntimeError(
+        "No models satisfy the RMSE threshold "
+        "and have usable fill-volume metadata."
+    )
+
+top20 = (
+    top20
+    .sort_values(["date", "rank"])
+    .reset_index(drop=True)
+)
+
+# Rank 1 is now the lowest volume-penalised SCORE,
+# not necessarily the lowest raw RMSE.
+best = (
+    top20[top20["rank"] == 1]
+    .sort_values("date")
+    .copy()
+)
+
+
+# =============================================================================
+# 5. PRINT RESULTS
+# =============================================================================
+
+print("\n" + "=" * 120)
+print("20 VOLUME-PRIORITISED MODELS FOR EACH DATE")
+print("=" * 120)
+
+print(
+    top20[
+        [
+            "date",
+            "rank",
+            "run_id",
+            "fill_a_m",
+            "fill_b_m",
+            "fill_c_m",
+            "fill_z_m",
+            "fill_x_m",
+            "fill_y_m",
+            "fill_added_volume_Mm3",
+            "rmse_filtered_m",
+            "score",
+        ]
+    ].to_string(index=False)
+)
+
+print("\n" + "=" * 120)
+print("BEST VOLUME-ADJUSTED MODEL FOR EACH DATE")
+print("=" * 120)
+
+print(
+    best[
+        [
+            "date",
+            "run_id",
+            "fill_a_m",
+            "fill_b_m",
+            "fill_c_m",
+            "fill_z_m",
+            "fill_x_m",
+            "fill_y_m",
+            "fill_added_volume_Mm3",
+            "rmse_filtered_m",
+            "score",
+        ]
+    ].to_string(index=False)
+)
+
+
+# =============================================================================
+# 6. SAVE RESULTS TABLES
+# =============================================================================
+
+BASE_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+top20.to_csv(
+    OUTPUT_CSV,
+    index=False,
+)
+
+all_acceptable.to_csv(
+    OUTPUT_ALL_ACCEPTABLE_CSV,
+    index=False,
+)
+
+print(f"\nSaved top-20 table: {OUTPUT_CSV}")
+
+print(
+    "Saved all acceptable models: "
+    f"{OUTPUT_ALL_ACCEPTABLE_CSV}"
+)
+
+
+# =============================================================================
+# 7. PARAMETERS TO PLOT
+# =============================================================================
 
 plot_parameters = [
+
     ("fill_a_m", "A", "Semi-axis A (m)", 1),
     ("fill_b_m", "B", "Semi-axis B (m)", 1),
     ("fill_c_m", "C", "Semi-axis C (m)", 1),
+
     ("fill_z_m", "z", "z (m)", 1),
     ("fill_x_m", "x", "x (m)", 1),
     ("fill_y_m", "y", "y (m)", 1),
-    ("final_added_volume_m3", "Final added volume", "Volume ($10^6$ m$^3$)", 1e6),
-    ("rmse_filtered_m", "Model fit", "RMSE (m)", 1),
+
+    (
+        "fill_added_volume_m3",
+        "Fill volume",
+        "Added volume ($10^6$ m$^3$)",
+        1e6,
+    ),
+
+    (
+        "rmse_filtered_m",
+        "Model fit",
+        "RMSE (m)",
+        1,
+    ),
 ]
 
 
-def weighted_quantile(values, weights, probs=(0.05, 0.25, 0.75, 0.95)):
-    """Weighted inverse-CDF quantiles, robust to missing parameter values."""
-    values = np.asarray(values, dtype=float)
-    weights = np.asarray(weights, dtype=float)
-    mask = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
-    if not mask.any():
-        return np.full(len(probs), np.nan)
-    v = values[mask]
-    w = weights[mask]
-    order = np.argsort(v)
-    v, w = v[order], w[order]
-    cdf = np.cumsum(w) / np.sum(w)
-    return v[np.searchsorted(cdf, probs, side="left").clip(max=len(v) - 1)]
+# =============================================================================
+# 8. CREATE 3 x 3 FIGURE
+# =============================================================================
+
+fig, axes = plt.subplots(
+    nrows=3,
+    ncols=3,
+    figsize=(10, 8),
+    sharex=True,
+)
+
+axes = axes.flatten()
 
 
-def misfit_weights(rmse, fraction=WEIGHT_TEMPERATURE_FRACTION):
-    """Relative-RMSE weights; avoids temperature depending on absolute RMSE."""
-    rmse = np.asarray(rmse, dtype=float)
-    if not np.isfinite(rmse).all():
-        raise ValueError("Misfit weights require finite RMSE values")
-    excess = rmse - np.min(rmse)
-    spread = np.max(excess)
-    if spread <= 1e-12:
-        return np.full(len(rmse), 1.0 / len(rmse))
-    tau = max(fraction * spread, 1e-12)
-    scores = -0.5 * (excess / tau) ** 2
-    scores -= np.max(scores)
-    weights = np.exp(scores)
-    return weights / weights.sum()
+# =============================================================================
+# 9. PLOT PARAMETERS
+# =============================================================================
 
+for ax, (column, title, ylabel, scale) in zip(
+    axes,
+    plot_parameters,
+):
 
-all_results = []
-for date_string in DATES:
-    ranking_file = (BASE_DIR / f"peak_model_inversion_dense_{date_string}"
-                    / "peak_model_ranking.csv")
-    if not ranking_file.exists():
-        raise FileNotFoundError(f"Ranking file not found: {ranking_file}")
-    ranking = pd.read_csv(ranking_file, dtype={"run_id": str})
-    ranking["run_id"] = ranking["run_id"].str.strip().str.zfill(6)
-    ranking["rmse_filtered_m"] = pd.to_numeric(
-        ranking["rmse_filtered_m"], errors="coerce")
-    ranking = ranking.loc[
-        ranking["status"].eq("ok") & np.isfinite(ranking["rmse_filtered_m"])
-    ].copy()
-    # Avoid selecting duplicate model IDs for the same date.
-    ranking = (ranking.sort_values("rmse_filtered_m")
-               .drop_duplicates(subset="run_id", keep="first"))
-    ranking = ranking.merge(models, on="run_id", how="inner", validate="many_to_one")
-    if len(ranking) < N_BEST:
-        print(f"WARNING: {date_string}: only {len(ranking)} valid ranked models with metadata")
-    ranking = ranking.nsmallest(N_BEST, "rmse_filtered_m").copy()
-    if ranking.empty:
-        print(f"WARNING: {date_string}: no matched valid models; skipping")
-        continue
-    ranking["rank"] = np.arange(1, len(ranking) + 1)
-    ranking["date"] = pd.to_datetime(date_string, format="%Y%m%d")
-    ranking["weight"] = misfit_weights(ranking["rmse_filtered_m"].to_numpy())
-    all_results.append(ranking)
+    # All 20 selected models at each date
+    ax.scatter(
+        top20["date"],
+        top20[column] / scale,
+        s=24,
+        alpha=0.35,
+        label="20 volume-prioritised models",
+        zorder=2,
+    )
 
-if not all_results:
-    raise RuntimeError("No valid models with metadata could be matched to inversion rankings")
+    # Best volume-adjusted model
+    ax.plot(
+        best["date"],
+        best[column] / scale,
+        marker="o",
+        markersize=4.5,
+        linewidth=1.3,
+        label="Best volume-adjusted score",
+        zorder=3,
+    )
 
-top20 = pd.concat(all_results, ignore_index=True).sort_values(["date", "rank"])
-top20.to_csv(OUTPUT_CSV, index=False)
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
 
-summaries = []
-for date, group in top20.groupby("date", sort=True):
-    row = {"date": date, "n_models": len(group),
-           "effective_n": 1.0 / np.sum(group["weight"].to_numpy() ** 2),
-           "best_run_id": group.iloc[0]["run_id"],
-           "minimum_rmse_m": group["rmse_filtered_m"].min()}
-    for column, _, _, _ in plot_parameters:
-        values = pd.to_numeric(group[column], errors="coerce").to_numpy(float)
-        weights = group["weight"].to_numpy(float)
-        valid = np.isfinite(values)
-        row[f"{column}_best"] = values[0]
-        row[f"{column}_mean"] = (np.average(values[valid], weights=weights[valid])
-                                    if valid.any() else np.nan)
-        q05, q25, q75, q95 = weighted_quantile(values, weights)
-        row.update({f"{column}_{p}": v for p, v in
-                    zip(("q05", "q25", "q75", "q95"),
-                        (q05, q25, q75, q95))})
-    summaries.append(row)
+    ax.grid(
+        axis="y",
+        alpha=0.2,
+        linewidth=0.6,
+    )
 
-summary = pd.DataFrame(summaries).sort_values("date")
-summary.to_csv(OUTPUT_SUMMARY_CSV, index=False)
-
-fig, axes = plt.subplots(3, 3, figsize=(12, 8.7), sharex=True)
-axes = axes.ravel()
-dates = pd.to_datetime(summary["date"])
-
-for idx, (ax, (column, title, ylabel, scale)) in enumerate(
-        zip(axes, plot_parameters)):
-    series = lambda suffix: summary[f"{column}_{suffix}"].to_numpy(float) / scale
-    ax.fill_between(dates, series("q05"), series("q95"), color="C0", alpha=0.14,
-                    label="Weighted 5–95%", linewidth=0)
-    ax.fill_between(dates, series("q25"), series("q75"), color="C0", alpha=0.30,
-                    label="Weighted 25–75%", linewidth=0)
-    ax.scatter(top20["date"], top20[column] / scale, s=9, color="0.35",
-               alpha=0.17, linewidths=0, label="Top-20 models", zorder=2)
-    ax.plot(dates, series("mean"), "o-", color="C0", lw=1.7, ms=4.2,
-            label="Misfit-weighted estimate", zorder=4)
-    ax.plot(dates, series("best"), "--", color="C3", lw=0.9,
-            alpha=0.7, label="Single best model", zorder=3)
-    ax.set(title=title, ylabel=ylabel)
-    ax.grid(axis="y", alpha=0.2, lw=0.6)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.text(0.02, 0.96, f"({chr(97 + idx)})", transform=ax.transAxes,
-            ha="left", va="top", fontweight="bold")
-    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b\n%Y"))
 
-axes[8].axis("off")
+
+# =============================================================================
+# 10. DATE FORMATTING
+# =============================================================================
+
+for ax in axes[:8]:
+
+    ax.xaxis.set_major_locator(
+        mdates.MonthLocator(interval=2)
+    )
+
+    ax.xaxis.set_major_formatter(
+        mdates.DateFormatter("%b\n%Y")
+    )
+
+
+# =============================================================================
+# 11. NINTH PANEL = LEGEND
+# =============================================================================
+
+legend_ax = axes[8]
+legend_ax.axis("off")
+
 handles, labels = axes[0].get_legend_handles_labels()
-axes[8].legend(handles, labels, loc="upper center", frameon=False, fontsize=9)
-axes[8].text(0.5, 0.32,
-             "20 lowest-RMSE models per date\n"
-             "Shaded bands: misfit-weighted quantiles\n"
-             "Bands show ensemble spread, not formal confidence limits",
-             ha="center", va="center", transform=axes[8].transAxes, fontsize=8)
-fig.suptitle("Evolution of misfit-weighted top-20 inversion models", y=0.995, fontsize=12)
-fig.tight_layout(rect=[0, 0, 1, 0.97], h_pad=1.3, w_pad=1.3)
-fig.savefig(OUTPUT_FIGURE, dpi=300, bbox_inches="tight")
-fig.savefig(OUTPUT_PDF, bbox_inches="tight")
-print(f"Saved: {OUTPUT_FIGURE}\nSaved: {OUTPUT_PDF}\n"
-      f"Saved: {OUTPUT_CSV}\nSaved: {OUTPUT_SUMMARY_CSV}")
+
+legend_ax.legend(
+    handles,
+    labels,
+    loc="center",
+    frameon=False,
+    fontsize=9,
+)
+
+legend_ax.text(
+    0.5,
+    0.26,
+    f"Only models with RMSE < {RMSE_THRESHOLD:g} m.\n"
+    f"Up to {N_BEST} models per date.\n\n"
+    "Score = RMSE + "
+    f"{LAMBDA_VOLUME:g} × fill volume\n"
+    "(million cubic metres).\n\n"
+    "Volume is measured relative\n"
+    "to the excavated crater.",
+    ha="center",
+    va="center",
+    transform=legend_ax.transAxes,
+    fontsize=8,
+)
+
+
+# =============================================================================
+# 12. PANEL LABELS
+# =============================================================================
+
+panel_labels = [
+    "(a)", "(b)", "(c)",
+    "(d)", "(e)", "(f)",
+    "(g)", "(h)",
+]
+
+for ax, label in zip(
+    axes[:8],
+    panel_labels,
+):
+
+    ax.text(
+        0.02,
+        0.96,
+        label,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontweight="bold",
+    )
+
+
+# =============================================================================
+# 13. FINAL FORMATTING
+# =============================================================================
+
+fig.suptitle(
+    "Evolution of volume-prioritised models (RMSE < 20 m)",
+    fontsize=11,
+    y=0.99,
+)
+
+fig.tight_layout(
+    rect=[0, 0, 1, 0.97],
+    h_pad=1.3,
+    w_pad=1.5,
+)
+
+
+# =============================================================================
+# 14. SAVE FIGURES
+# =============================================================================
+
+fig.savefig(
+    OUTPUT_FIGURE,
+    dpi=300,
+)
+
+fig.savefig(
+    OUTPUT_PDF,
+)
+
+print(f"\nSaved PNG: {OUTPUT_FIGURE}")
+print(f"Saved PDF: {OUTPUT_PDF}")
+
+
+# =============================================================================
+# 15. SHOW
+# =============================================================================
+
 plt.show()
