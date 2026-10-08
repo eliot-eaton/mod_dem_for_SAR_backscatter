@@ -17,14 +17,14 @@ DATES = ['20201021', '20201101', '20201226', '20210106',
 
 N_BEST = 20
 RMSE_THRESHOLD_M = 25.0  # Strictly less than 25 m
-VOLUME_PENALTY_M_PER_MM3 = 3.0  # Score = RMSE (m) + lambda * fill volume (million m3)
+VOLUME_PENALTY_M_PER_MM3 = 5.0  # Score = RMSE (m) + lambda * fill volume (million m3)
 WEIGHT_TEMPERATURE_FRACTION = 0.5
 
 OUTPUT_FIGURE = BASE_DIR / 'top20_volume_weighted_model_evolution.png'
 OUTPUT_PDF = BASE_DIR / 'top20_volume_weighted_model_evolution.pdf'
 OUTPUT_CSV = BASE_DIR / 'top20_volume_weighted_model_evolution.csv'
 OUTPUT_SUMMARY_CSV = BASE_DIR / 'top20_volume_weighted_model_summary.csv'
-OUTPUT_ELIGIBLE_CSV = BASE_DIR / 'all_eligible_models_rmse_below_20.csv'
+OUTPUT_ELIGIBLE_CSV = BASE_DIR / 'all_eligible_models_rmse_below_25.csv'
 
 mpl.rcParams.update({
     'figure.figsize': (10, 8), 'font.size': 9,
