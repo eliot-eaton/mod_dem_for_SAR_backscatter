@@ -15,9 +15,9 @@ MODEL_DIR = Path('/scratch/ee16eme/sinabung_asc_tsx/mod_dem_Dome/synthetic_sweep
 DATES = ['20201021', '20201101', '20201226', '20210106',
          '20210117', '20210128', '20210208', '20210219']
 
-N_BEST = 10
+N_BEST = 20
 RMSE_THRESHOLD_M = 25.0  # Strictly less than 25 m
-VOLUME_PENALTY_M_PER_MM3 = 4.0  # Score = RMSE (m) + lambda * fill volume (million m3)
+VOLUME_PENALTY_M_PER_MM3 = 3.0  # Score = RMSE (m) + lambda * fill volume (million m3)
 WEIGHT_TEMPERATURE_FRACTION = 0.5
 
 OUTPUT_FIGURE = BASE_DIR / 'top20_volume_weighted_model_evolution.png'
